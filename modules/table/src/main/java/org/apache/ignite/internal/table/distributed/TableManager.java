@@ -159,6 +159,7 @@ import org.apache.ignite.internal.partition.replicator.NaiveAsyncReadWriteLock;
 import org.apache.ignite.internal.partition.replicator.PartitionReplicaLifecycleManager;
 import org.apache.ignite.internal.partition.replicator.ReliableCatalogVersions;
 import org.apache.ignite.internal.partition.replicator.ReplicaTableProcessor;
+import org.apache.ignite.internal.partition.replicator.ZoneResourcesManager.ZonePartitionResources;
 import org.apache.ignite.internal.partition.replicator.network.PartitionReplicationMessagesFactory;
 import org.apache.ignite.internal.partition.replicator.network.replication.ChangePeersAndLearnersAsyncReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.PartitionDataStorage;
@@ -755,6 +756,8 @@ public class TableManager implements IgniteTablesInternal, IgniteComponent {
 
         PartitionSet singlePartitionIdSet = PartitionSet.of(partitionIndex);
 
+        ZonePartitionResources resources = partitionReplicaLifecycleManager.zonePartitionResources(zonePartitionId);
+
         CompletableFuture<?>[] futures = zoneTables.stream()
                 .map(tbl -> inBusyLockAsync(busyLock, () -> {
                     return getOrCreatePartitionStorages(tbl, singlePartitionIdSet)
@@ -774,7 +777,7 @@ public class TableManager implements IgniteTablesInternal, IgniteComponent {
                                         )
                                 );
 
-                                preparePartitionResourcesAndLoadToZoneReplicaBusy(tbl, zonePartitionId, onRecovery);
+                                preparePartitionResourcesAndLoadToZoneReplicaBusy(tbl, zonePartitionId, resources, onRecovery);
                             }), ioExecutor)
                             // If the table is already closed, it's not a problem (probably the node is stopping).
                             .exceptionally(ignoreTableClosedException());
@@ -966,7 +969,12 @@ public class TableManager implements IgniteTablesInternal, IgniteComponent {
                     var zonePartitionId = new ZonePartitionId(zoneDescriptor.id(), i);
 
                     if (partitionReplicaLifecycleManager.hasLocalPartition(zonePartitionId)) {
-                        preparePartitionResourcesAndLoadToZoneReplicaBusy(table, zonePartitionId, false);
+                        preparePartitionResourcesAndLoadToZoneReplicaBusy(
+                                table,
+                                zonePartitionId,
+                                partitionReplicaLifecycleManager.zonePartitionResources(zonePartitionId),
+                                false
+                        );
                     }
                 }
             }), ioExecutor);
@@ -995,7 +1003,10 @@ public class TableManager implements IgniteTablesInternal, IgniteComponent {
      * @param zonePartitionId Zone Partition ID.
      */
     private void preparePartitionResourcesAndLoadToZoneReplicaBusy(
-            TableViewInternal table, ZonePartitionId zonePartitionId, boolean onNodeRecovery
+            TableViewInternal table,
+            ZonePartitionId zonePartitionId,
+            ZonePartitionResources resources,
+            boolean onNodeRecovery
     ) {
         int partId = zonePartitionId.partitionId();
 
@@ -1005,7 +1016,7 @@ public class TableManager implements IgniteTablesInternal, IgniteComponent {
 
         var tablePartitionId = new TablePartitionId(tableId, partId);
 
-        var safeTimeTracker = new SafeTimeValuesTracker(HybridTimestamp.MIN_VALUE);
+        SafeTimeValuesTracker safeTimeTracker = resources.safeTimeTracker();
 
         // TODO https://issues.apache.org/jira/browse/IGNITE-22522 After switching to the colocation track, the storageIndexTracker
         //  will no longer need to be transferred to the table listeners.
@@ -3056,7 +3067,11 @@ public class TableManager implements IgniteTablesInternal, IgniteComponent {
 
         return stopReplicaFuture
                 .thenCompose(v -> {
-                    closePartitionTrackers(table.internalTable(), tablePartitionId.partitionId());
+                    if (nodeProperties.colocationEnabled()) {
+                        closeTracker(table.internalTable().getPartitionStorageIndexTracker(tablePartitionId.partitionId()));
+                    } else {
+                        closePartitionTrackers(table.internalTable(), tablePartitionId.partitionId());
+                    }
 
                     minTimeCollectorService.removePartition(tablePartitionId);
 

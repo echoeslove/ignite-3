@@ -96,6 +96,8 @@ public class ItDisasterRecoveryManagerTest extends ClusterPerTestIntegrationTest
     /** Table name. */
     public static final String TABLE_NAME = "TEST_TABLE";
 
+    private static final String SECOND_TABLE_NAME = "SECOND_TEST_TABLE";
+
     private static final String ZONE_NAME = "ZONE_" + TABLE_NAME;
 
     private static final int INITIAL_NODES = 1;
@@ -493,27 +495,45 @@ public class ItDisasterRecoveryManagerTest extends ClusterPerTestIntegrationTest
 
     @Test
     @WithSystemProperty(key = IgniteSystemProperties.COLOCATION_FEATURE_FLAG, value = "true")
+    @ZoneParams(nodes = 3, replicas = 3, partitions = 2)
     void testRestartZonePartitions() {
         IgniteImpl node = unwrapIgniteImpl(cluster.aliveNode());
 
+        executeSql(String.format(
+                "CREATE TABLE %s (id INT PRIMARY KEY, valInt INT) ZONE %s",
+                SECOND_TABLE_NAME,
+                ZONE_NAME
+        ));
+
         insert(0, 0);
         insert(1, 1);
+        insert(0, 0, SECOND_TABLE_NAME);
+        insert(1, 1, SECOND_TABLE_NAME);
 
-        int partitionId = 0;
+        Set<Integer> partitionIds = Set.of(0, 1);
 
         CompletableFuture<Void> restartPartitionsFuture = node.disasterRecoveryManager().restartPartitions(
                 Set.of(node.name()),
                 ZONE_NAME,
-                Set.of(partitionId)
+                partitionIds
         );
 
         assertThat(restartPartitionsFuture, willCompleteSuccessfully());
-        assertThat(awaitPrimaryReplicaForNow(node, new ZonePartitionId(zoneId(node), partitionId)), willCompleteSuccessfully());
+
+        for (int partitionId : partitionIds) {
+            assertThat(awaitPrimaryReplicaForNow(node, new ZonePartitionId(zoneId(node), partitionId)), willCompleteSuccessfully());
+        }
+
+        assertThat(selectAll(), hasSize(2));
+        assertThat(selectAll(SECOND_TABLE_NAME), hasSize(2));
 
         insert(2, 2);
         insert(3, 3);
+        insert(2, 2, SECOND_TABLE_NAME);
+        insert(3, 3, SECOND_TABLE_NAME);
 
         assertThat(selectAll(), hasSize(4));
+        assertThat(selectAll(SECOND_TABLE_NAME), hasSize(4));
     }
 
     @WithSystemProperty(key = IgniteSystemProperties.COLOCATION_FEATURE_FLAG, value = "false")

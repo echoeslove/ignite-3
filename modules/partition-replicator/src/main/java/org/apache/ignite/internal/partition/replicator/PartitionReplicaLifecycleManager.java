@@ -1625,6 +1625,8 @@ public class PartitionReplicaLifecycleManager extends
                         try {
                             return replicaMgr.stopReplica(zonePartitionId)
                                     .thenCompose(replicaWasStopped -> {
+                                        closeTrackers(zonePartitionId);
+
                                         afterReplicaStopAction.accept(replicaWasStopped);
 
                                         if (!replicaWasStopped) {
@@ -1640,6 +1642,16 @@ public class PartitionReplicaLifecycleManager extends
                         }
                     });
         });
+    }
+
+    private void closeTrackers(ZonePartitionId zonePartitionId) {
+        // Resources can be null if the replica was never started (or was already stopped) on this node and we are just stopping
+        // the stopped replica.
+        ZonePartitionResources replicaResources = zoneResourcesManager.getZonePartitionResources(zonePartitionId);
+
+        if (replicaResources != null) {
+            replicaResources.closeTrackers();
+        }
     }
 
     /**

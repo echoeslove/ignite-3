@@ -37,6 +37,7 @@ import static org.apache.ignite.internal.util.IgniteUtils.startAsync;
 import static org.apache.ignite.internal.util.IgniteUtils.stopAsync;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.ArgumentMatchers.any;
@@ -76,6 +77,7 @@ import org.apache.ignite.internal.failure.FailureManager;
 import org.apache.ignite.internal.hlc.ClockService;
 import org.apache.ignite.internal.hlc.HybridClock;
 import org.apache.ignite.internal.hlc.HybridClockImpl;
+import org.apache.ignite.internal.hlc.HybridTimestamp;
 import org.apache.ignite.internal.lang.NodeStoppingException;
 import org.apache.ignite.internal.lowwatermark.LowWatermark;
 import org.apache.ignite.internal.manager.ComponentContext;
@@ -114,6 +116,8 @@ import org.apache.ignite.internal.tx.storage.state.rocksdb.TxStateRocksDbPartiti
 import org.apache.ignite.internal.tx.storage.state.rocksdb.TxStateRocksDbSharedStorage;
 import org.apache.ignite.internal.tx.storage.state.rocksdb.TxStateRocksDbStorage;
 import org.apache.ignite.internal.util.PendingComparableValuesTracker;
+import org.apache.ignite.internal.util.SafeTimeValuesTracker;
+import org.apache.ignite.internal.util.TrackerClosedException;
 import org.apache.ignite.internal.worker.ThreadAssertions;
 import org.apache.ignite.network.NetworkAddress;
 import org.junit.jupiter.api.AfterEach;
@@ -199,6 +203,7 @@ class PartitionReplicaLifecycleManagerTest extends BaseIgniteAbstractTest {
                 txStatePartitionStorage,
                 raftGroupListener,
                 partitionSnapshotStorage,
+                new SafeTimeValuesTracker(HybridTimestamp.MIN_VALUE),
                 new PendingComparableValuesTracker<>(0L)
         ));
 
@@ -345,6 +350,8 @@ class PartitionReplicaLifecycleManagerTest extends BaseIgniteAbstractTest {
 
         var zonePartitionId = new ZonePartitionId(zoneId, 0);
 
+        ZonePartitionResources resourcesBeforeRestart = partitionReplicaLifecycleManager.zonePartitionResources(zonePartitionId);
+
         assertThat(
                 partitionReplicaLifecycleManager.restartPartition(zonePartitionId, Long.MAX_VALUE, clock.nowLong()),
                 willCompleteSuccessfully()
@@ -352,6 +359,8 @@ class PartitionReplicaLifecycleManagerTest extends BaseIgniteAbstractTest {
 
         assertThat(beforeReplicaStoppedFuture.thenApply(LocalPartitionReplicaEventParameters::zonePartitionId), willBe(zonePartitionId));
         assertThat(afterReplicaStoppedFuture.thenApply(LocalPartitionReplicaEventParameters::zonePartitionId), willBe(zonePartitionId));
+        assertThrows(TrackerClosedException.class, resourcesBeforeRestart.safeTimeTracker()::current);
+        assertThrows(TrackerClosedException.class, resourcesBeforeRestart.storageIndexTracker()::current);
     }
 
     @Test
