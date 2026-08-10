@@ -47,7 +47,7 @@ public class DotNetComputeExecutorTest {
         assertEquals(1, proc.exitValue());
 
         String result = new String(proc.getInputStream().readAllBytes(), UTF_8);
-        assertThat(result, containsString("file was not found"));
+        assertThat(result, containsString("my.dll"));
     }
 
     @Test

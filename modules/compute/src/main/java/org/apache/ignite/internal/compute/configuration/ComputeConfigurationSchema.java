@@ -53,4 +53,14 @@ public class ComputeConfigurationSchema {
     @Range(min = 0)
     @Value(hasDefault = true)
     public final long statesLifetimeMillis = TimeUnit.MINUTES.toMillis(1);
+
+    /** Maximum number of idle job class loaders retained by this node. Zero disables idle reuse. */
+    @Range(min = 0)
+    @Value(hasDefault = true)
+    public final int classLoaderCacheMaxIdleEntries = 16;
+
+    /** Time in milliseconds to retain an idle job class loader. */
+    @Range(min = 1)
+    @Value(hasDefault = true)
+    public final long classLoaderCacheIdleTimeoutMillis = TimeUnit.MINUTES.toMillis(10);
 }

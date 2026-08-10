@@ -19,14 +19,18 @@ package org.apache.ignite.internal.compute.loader;
 
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.concurrent.CompletableFuture.failedFuture;
+import static org.apache.ignite.configuration.notifications.ConfigurationListener.fromNewValueConsumer;
 import static org.apache.ignite.internal.util.CompletableFutures.nullCompletedFuture;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Function;
-import java.util.stream.Collectors;
+import org.apache.ignite.configuration.notifications.ConfigurationListener;
 import org.apache.ignite.deployment.DeploymentUnit;
 import org.apache.ignite.deployment.version.Version;
+import org.apache.ignite.internal.compute.configuration.ComputeConfiguration;
 import org.apache.ignite.internal.deployunit.DeploymentStatus;
 import org.apache.ignite.internal.deployunit.DeploymentUnitAccessor;
 import org.apache.ignite.internal.deployunit.DisposableDeploymentUnit;
@@ -37,16 +41,24 @@ import org.apache.ignite.internal.lang.IgniteInternalException;
 import org.apache.ignite.internal.logger.IgniteLogger;
 import org.apache.ignite.internal.logger.Loggers;
 import org.apache.ignite.internal.util.CompletableFutures;
-import org.apache.ignite.internal.util.RefCountedObjectPool;
 import org.apache.ignite.lang.ErrorGroups.Compute;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Manages job context.
  */
-public class JobContextManager {
+public class JobContextManager implements AutoCloseable {
     private static final IgniteLogger LOG = Loggers.forClass(JobContextManager.class);
 
-    private final RefCountedObjectPool<List<DeploymentUnit>, JobClassLoader> classLoaderPool = new RefCountedObjectPool<>();
+    private static final int MAX_INVALIDATION_RETRIES = 16;
+
+    private final JobClassLoaderCache classLoaderCache;
+
+    private final @Nullable ComputeConfiguration configuration;
+
+    private final ConfigurationListener<Integer> maxIdleEntriesListener;
+
+    private final ConfigurationListener<Long> idleTimeoutListener;
 
     private final IgniteDeployment deployment;
     /**
@@ -65,15 +77,49 @@ public class JobContextManager {
      * @param deployment The deployment.
      * @param deploymentUnitAccessor The deployer service.
      * @param classLoaderFactory The class loader factory.
+     * @param configuration Compute configuration.
+     * @param scheduler Node-wide scheduler used for idle loader expiration.
      */
     public JobContextManager(
             IgniteDeployment deployment,
             DeploymentUnitAccessor deploymentUnitAccessor,
-            JobClassLoaderFactory classLoaderFactory
+            JobClassLoaderFactory classLoaderFactory,
+            ComputeConfiguration configuration,
+            ScheduledExecutorService scheduler
     ) {
         this.deployment = deployment;
         this.deploymentUnitAccessor = deploymentUnitAccessor;
         this.classLoaderFactory = classLoaderFactory;
+        this.configuration = configuration;
+        classLoaderCache = new JobClassLoaderCache(
+                scheduler,
+                configuration.classLoaderCacheMaxIdleEntries().value(),
+                configuration.classLoaderCacheIdleTimeoutMillis().value()
+        );
+
+        maxIdleEntriesListener = fromNewValueConsumer(classLoaderCache::updateMaxIdleEntries);
+        idleTimeoutListener = fromNewValueConsumer(classLoaderCache::updateIdleTimeoutMillis);
+
+        configuration.classLoaderCacheMaxIdleEntries().listen(maxIdleEntriesListener);
+        configuration.classLoaderCacheIdleTimeoutMillis().listen(idleTimeoutListener);
+    }
+
+    /** Constructor for tests that do not use the configuration subsystem. */
+    JobContextManager(
+            IgniteDeployment deployment,
+            DeploymentUnitAccessor deploymentUnitAccessor,
+            JobClassLoaderFactory classLoaderFactory,
+            ScheduledExecutorService scheduler,
+            int maxIdleEntries,
+            long idleTimeoutMillis
+    ) {
+        this.deployment = deployment;
+        this.deploymentUnitAccessor = deploymentUnitAccessor;
+        this.classLoaderFactory = classLoaderFactory;
+        configuration = null;
+        maxIdleEntriesListener = fromNewValueConsumer(ignored -> {});
+        idleTimeoutListener = fromNewValueConsumer(ignored -> {});
+        classLoaderCache = new JobClassLoaderCache(scheduler, maxIdleEntries, idleTimeoutMillis);
     }
 
     /**
@@ -83,11 +129,7 @@ public class JobContextManager {
      * @return The class loader.
      */
     public CompletableFuture<JobContext> acquireClassLoader(List<DeploymentUnit> units) {
-        CompletableFuture<JobContext> loaderFut = normalizeVersions(units)
-                .thenCompose(normalizedUnits -> checkUnitStatuses(normalizedUnits).thenApply(v -> normalizedUnits))
-                .thenCompose(normalizedUnits -> onDemandDeploy(normalizedUnits).thenApply(v -> normalizedUnits))
-                .thenApply(normalizedUnits -> classLoaderPool.acquire(normalizedUnits, this::createClassLoader))
-                .thenApply(loader -> new JobContext(loader, this::releaseClassLoader));
+        CompletableFuture<JobContext> loaderFut = acquireClassLoaderInternal(units);
 
         CompletableFuture<JobContext> contextFut = loaderFut
                 .whenComplete((context, error) -> {
@@ -109,28 +151,84 @@ public class JobContextManager {
         return contextFut;
     }
 
+    private CompletableFuture<JobContext> acquireClassLoaderInternal(List<DeploymentUnit> requestedUnits) {
+        return acquireClassLoaderInternal(requestedUnits, 0);
+    }
+
+    private CompletableFuture<JobContext> acquireClassLoaderInternal(
+            List<DeploymentUnit> requestedUnits,
+            int invalidationRetries
+    ) {
+        return normalizeVersions(requestedUnits).thenCompose(normalizedUnits -> {
+            JobClassLoaderCache.InvalidationSnapshot invalidationSnapshot = classLoaderCache.invalidationSnapshot(normalizedUnits);
+
+            return checkUnitStatuses(normalizedUnits)
+                    .thenCompose(unused -> onDemandDeploy(normalizedUnits))
+                    .thenCompose(unused -> {
+                        JobClassLoaderCache.Lease lease = classLoaderCache.acquire(
+                                normalizedUnits,
+                                invalidationSnapshot,
+                                this::createClassLoader
+                        );
+
+                        if (lease == null) {
+                            if (invalidationRetries >= MAX_INVALIDATION_RETRIES) {
+                                return failedFuture(new IgniteInternalException(
+                                        Compute.CLASS_LOADER_ERR,
+                                        "Deployment units changed repeatedly while acquiring a class loader: " + normalizedUnits
+                                ));
+                            }
+
+                            return acquireClassLoaderInternal(requestedUnits, invalidationRetries + 1);
+                        }
+
+                        return completedFuture(new JobContext(
+                                lease.classLoader(),
+                                ignored -> classLoaderCache.release(lease)
+                        ));
+                    });
+        });
+    }
+
     /**
      * Creates a class loader for the given deployment units. The units will be acquired. The class loader will be closed when it is not
      * used by any other job.
      */
     private JobClassLoader createClassLoader(List<DeploymentUnit> units) {
-        List<DisposableDeploymentUnit> disposableDeploymentUnits = units.stream()
-                .map(deploymentUnitAccessor::acquire)
-                .collect(Collectors.toList());
-        return classLoaderFactory.createClassLoader(disposableDeploymentUnits);
+        List<DisposableDeploymentUnit> disposableDeploymentUnits = new ArrayList<>(units.size());
+
+        try {
+            for (DeploymentUnit unit : units) {
+                disposableDeploymentUnits.add(deploymentUnitAccessor.acquire(unit));
+            }
+
+            return classLoaderFactory.createClassLoader(disposableDeploymentUnits);
+        } catch (RuntimeException | Error t) {
+            for (int i = disposableDeploymentUnits.size() - 1; i >= 0; i--) {
+                try {
+                    disposableDeploymentUnits.get(i).release();
+                } catch (RuntimeException | Error releaseError) {
+                    t.addSuppressed(releaseError);
+                }
+            }
+
+            throw t;
+        }
     }
 
-    /**
-     * Releases a class loader. If the class loader is not used by any other job, it will be closed and the deployment units will be
-     * released.
-     */
-    private void releaseClassLoader(JobContext jobContext) {
-        List<DeploymentUnit> units = jobContext.classLoader().units().stream()
-                .map(DisposableDeploymentUnit::unit)
-                .collect(Collectors.toList());
-        if (classLoaderPool.release(units)) {
-            jobContext.classLoader().close();
+    /** Invalidates cached class loaders that contain the deployment unit. */
+    public void invalidate(DeploymentUnit unit) {
+        classLoaderCache.invalidate(unit);
+    }
+
+    @Override
+    public void close() {
+        if (configuration != null) {
+            configuration.classLoaderCacheMaxIdleEntries().stopListen(maxIdleEntriesListener);
+            configuration.classLoaderCacheIdleTimeoutMillis().stopListen(idleTimeoutListener);
         }
+
+        classLoaderCache.close();
     }
 
     /**

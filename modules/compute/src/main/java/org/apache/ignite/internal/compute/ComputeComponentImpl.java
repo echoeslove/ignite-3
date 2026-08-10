@@ -327,6 +327,7 @@ public class ComputeComponentImpl implements ComputeComponent, SystemViewProvide
         executionManager.stop();
         messaging.stop();
         executor.stop();
+        jobContextManager.close();
         computeViewProvider.stop();
         IgniteUtils.shutdownAndAwaitTermination(failoverExecutor, 10, TimeUnit.SECONDS);
 

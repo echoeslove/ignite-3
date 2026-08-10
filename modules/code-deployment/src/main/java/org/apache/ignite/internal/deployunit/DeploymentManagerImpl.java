@@ -36,6 +36,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -133,6 +134,8 @@ public class DeploymentManagerImpl implements IgniteDeployment {
 
     private final UnitDownloader unitDownloader;
 
+    private final List<Consumer<org.apache.ignite.deployment.DeploymentUnit>> obsoleteListeners = new CopyOnWriteArrayList<>();
+
     /**
      * Constructor.
      *
@@ -173,13 +176,34 @@ public class DeploymentManagerImpl implements IgniteDeployment {
         messaging = new DeployMessagingService(clusterService, cmgManager, deployer, tracker);
         unitDownloader = new UnitDownloader(deploymentUnitStore, nodeName, deployer, tracker, messaging);
 
-        nodeStatusCallback = new DefaultNodeCallback(deploymentUnitStore, undeployer, unitDownloader, cmgManager);
+        nodeStatusCallback = new DefaultNodeCallback(
+                deploymentUnitStore,
+                undeployer,
+                unitDownloader,
+                cmgManager,
+                this::notifyObsoleteListeners
+        );
         nodeStatusWatchListener = new NodeStatusWatchListener(deploymentUnitStore, nodeName, nodeStatusCallback);
 
         clusterEventCallback = new ClusterEventCallbackImpl(deploymentUnitStore, deployer, cmgManager, nodeName);
         clusterStatusWatchListener = new ClusterStatusWatchListener(clusterEventCallback);
 
         failover = new DeploymentUnitFailover(logicalTopology, deploymentUnitStore, deployer, nodeName);
+    }
+
+    /** Registers a listener that is invoked before an obsolete local deployment unit waits for acquired resources to be released. */
+    public void registerUnitObsoleteListener(Consumer<org.apache.ignite.deployment.DeploymentUnit> listener) {
+        obsoleteListeners.add(Objects.requireNonNull(listener));
+    }
+
+    private void notifyObsoleteListeners(org.apache.ignite.deployment.DeploymentUnit unit) {
+        for (Consumer<org.apache.ignite.deployment.DeploymentUnit> listener : obsoleteListeners) {
+            try {
+                listener.accept(unit);
+            } catch (RuntimeException e) {
+                LOG.warn("Failed to notify a deployment unit obsolescence listener [unit={}]", e, unit);
+            }
+        }
     }
 
     @Override

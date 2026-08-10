@@ -18,18 +18,25 @@
 package org.apache.ignite.internal.compute.loader;
 
 import static java.util.concurrent.CompletableFuture.completedFuture;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.apache.ignite.deployment.version.Version.LATEST;
+import static org.apache.ignite.internal.deployunit.DeploymentStatus.DEPLOYED;
 import static org.apache.ignite.internal.deployunit.DeploymentStatus.OBSOLETE;
 import static org.apache.ignite.internal.deployunit.DeploymentStatus.REMOVING;
 import static org.apache.ignite.internal.testframework.IgniteTestUtils.getPath;
 import static org.apache.ignite.internal.testframework.matchers.CompletableFutureExceptionMatcher.willThrowFast;
 import static org.apache.ignite.internal.util.CompletableFutures.falseCompletedFuture;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
@@ -39,10 +46,16 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import org.apache.ignite.deployment.DeploymentUnit;
 import org.apache.ignite.deployment.version.Version;
 import org.apache.ignite.internal.compute.util.DummyIgniteDeployment;
+import org.apache.ignite.internal.deployunit.DeploymentUnitAccessor;
 import org.apache.ignite.internal.deployunit.DeploymentUnitAccessorImpl;
 import org.apache.ignite.internal.deployunit.DisposableDeploymentUnit;
 import org.apache.ignite.internal.deployunit.FileDeployerService;
@@ -54,6 +67,7 @@ import org.apache.ignite.internal.testframework.BaseIgniteAbstractTest;
 import org.apache.ignite.internal.testframework.WorkDirectory;
 import org.apache.ignite.internal.testframework.WorkDirectoryExtension;
 import org.apache.ignite.internal.testframework.matchers.CompletableFutureExceptionMatcher;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -78,16 +92,32 @@ class JobContextManagerTest extends BaseIgniteAbstractTest {
 
     private JobContextManager classLoaderManager;
 
+    private DeploymentUnitAccessorImpl deploymentUnitAccessor;
+
+    private ScheduledExecutorService scheduler;
+
     @BeforeEach
     void setUp() {
         FileDeployerService deployerService = new FileDeployerService("test");
         deployerService.initUnitsFolder(unitsDir, workDir.resolve("tempDeployment"));
 
+        scheduler = Executors.newSingleThreadScheduledExecutor();
+        deploymentUnitAccessor = new DeploymentUnitAccessorImpl(deployerService);
+
         classLoaderManager = new JobContextManager(
                 deployment,
-                new DeploymentUnitAccessorImpl(deployerService),
-                jobClassLoaderFactory
+                deploymentUnitAccessor,
+                jobClassLoaderFactory,
+                scheduler,
+                16,
+                600_000
         );
+    }
+
+    @AfterEach
+    void tearDown() {
+        classLoaderManager.close();
+        scheduler.shutdownNow();
     }
 
     @Test
@@ -115,6 +145,151 @@ class JobContextManagerTest extends BaseIgniteAbstractTest {
         verify(jobClassLoaderFactory, times(1)).createClassLoader(deploymentUnits); // verify that class loader was created
 
         context.close();
+        context.close();
+
+        JobContext reusedContext = classLoaderManager.acquireClassLoader(units).join();
+        assertSame(toBeReturned, reusedContext.classLoader());
+        verify(jobClassLoaderFactory, times(1)).createClassLoader(deploymentUnits);
+
+        reusedContext.close();
+    }
+
+    @Test
+    void releasesAlreadyAcquiredUnitsWhenLaterAcquireFails() {
+        DeploymentUnit firstUnit = new DeploymentUnit("unit1", "1.0.0");
+        DeploymentUnit secondUnit = new DeploymentUnit("unit2", "1.0.0");
+        DeploymentUnitAccessor accessor = org.mockito.Mockito.mock(DeploymentUnitAccessor.class);
+        AtomicBoolean firstUnitReleased = new AtomicBoolean();
+        DisposableDeploymentUnit firstDisposableUnit = new DisposableDeploymentUnit(
+                firstUnit,
+                unitsDir.resolve("unit1/1.0.0"),
+                () -> firstUnitReleased.set(true)
+        );
+
+        doReturn(firstDisposableUnit).when(accessor).acquire(firstUnit);
+        org.mockito.Mockito.doThrow(new IllegalStateException("second acquire failed"))
+                .when(accessor).acquire(secondUnit);
+
+        try (JobContextManager manager = new JobContextManager(
+                deployment,
+                accessor,
+                jobClassLoaderFactory,
+                scheduler,
+                16,
+                600_000
+        )) {
+            assertThat(
+                    manager.acquireClassLoader(List.of(firstUnit, secondUnit)),
+                    willThrowFast(IllegalStateException.class, "second acquire failed")
+            );
+        }
+
+        assertTrue(firstUnitReleased.get());
+        verify(jobClassLoaderFactory, never()).createClassLoader(any());
+    }
+
+    @Test
+    void managerCloseReleasesIdleDeploymentUnit() {
+        DeploymentUnit unit = new DeploymentUnit("unit1", "1.0.0");
+
+        doAnswer(invocation -> new JobClassLoader(invocation.getArgument(0), getClass().getClassLoader()))
+                .when(jobClassLoaderFactory).createClassLoader(any());
+
+        JobContext context = classLoaderManager.acquireClassLoader(List.of(unit)).join();
+        context.close();
+
+        assertFalse(deploymentUnitAccessor.computeIfNotAcquired(unit, ignored -> {}));
+
+        classLoaderManager.close();
+
+        assertTrue(deploymentUnitAccessor.computeIfNotAcquired(unit, ignored -> {}));
+    }
+
+    @Test
+    void retriesStatusValidationWhenUnitIsInvalidatedBeforeCacheAcquire() {
+        DeploymentUnit unit = new DeploymentUnit("unit1", "1.0.0");
+        CompletableFuture<Boolean> onDemandDeployFuture = new CompletableFuture<>();
+
+        doReturn(completedFuture(DEPLOYED), completedFuture(OBSOLETE))
+                .when(deployment).clusterStatusAsync(unit.name(), unit.version());
+        doReturn(completedFuture(REMOVING))
+                .when(deployment).nodeStatusAsync(unit.name(), unit.version());
+        doReturn(onDemandDeployFuture)
+                .when(deployment).onDemandDeploy(unit.name(), unit.version());
+
+        CompletableFuture<JobContext> contextFuture = classLoaderManager.acquireClassLoader(List.of(unit));
+
+        classLoaderManager.invalidate(unit);
+        onDemandDeployFuture.complete(true);
+
+        assertThat(
+                contextFuture,
+                willThrowFast(
+                        DeploymentUnitUnavailableException.class,
+                        "Unit unit1:1.0.0 is unavailable. Cluster status: OBSOLETE, node status: REMOVING"
+                )
+        );
+        verify(jobClassLoaderFactory, never()).createClassLoader(any());
+    }
+
+    @Test
+    void unrelatedInvalidationsDoNotRetryInFlightAcquire() throws Exception {
+        DeploymentUnit requestedUnit = new DeploymentUnit("unit1", "1.0.0");
+        DeploymentUnit unrelatedUnit = new DeploymentUnit("unit2", "1.0.0");
+        CompletableFuture<Boolean> onDemandDeployFuture = new CompletableFuture<>();
+        CountDownLatch onDemandDeployStarted = new CountDownLatch(1);
+        JobClassLoader loader = mock(JobClassLoader.class);
+
+        doReturn(completedFuture(DEPLOYED))
+                .when(deployment).clusterStatusAsync(requestedUnit.name(), requestedUnit.version());
+        doAnswer(invocation -> {
+            onDemandDeployStarted.countDown();
+            return onDemandDeployFuture;
+        }).when(deployment).onDemandDeploy(requestedUnit.name(), requestedUnit.version());
+        doReturn(loader).when(jobClassLoaderFactory).createClassLoader(any());
+
+        CompletableFuture<JobContext> contextFuture = classLoaderManager.acquireClassLoader(List.of(requestedUnit));
+
+        assertTrue(onDemandDeployStarted.await(10, SECONDS));
+
+        CompletableFuture<Void> invalidations = CompletableFuture.runAsync(() -> {
+            for (int i = 0; i < 1_000; i++) {
+                classLoaderManager.invalidate(unrelatedUnit);
+            }
+        });
+
+        invalidations.get(10, SECONDS);
+        onDemandDeployFuture.complete(true);
+
+        JobContext context = contextFuture.get(10, SECONDS);
+        assertSame(loader, context.classLoader());
+
+        verify(deployment, times(1)).clusterStatusAsync(requestedUnit.name(), requestedUnit.version());
+        verify(deployment, times(1)).onDemandDeploy(requestedUnit.name(), requestedUnit.version());
+        verify(jobClassLoaderFactory, times(1)).createClassLoader(any());
+
+        context.close();
+    }
+
+    @Test
+    void failsAfterRepeatedRequestedUnitInvalidations() {
+        DeploymentUnit unit = new DeploymentUnit("unit1", "1.0.0");
+
+        doReturn(completedFuture(DEPLOYED))
+                .when(deployment).clusterStatusAsync(unit.name(), unit.version());
+        doAnswer(invocation -> {
+            classLoaderManager.invalidate(unit);
+            return completedFuture(true);
+        }).when(deployment).onDemandDeploy(unit.name(), unit.version());
+
+        assertThat(
+                classLoaderManager.acquireClassLoader(List.of(unit)),
+                willThrowFast(
+                        IgniteInternalException.class,
+                        "Deployment units changed repeatedly while acquiring a class loader"
+                )
+        );
+        verify(jobClassLoaderFactory, never()).createClassLoader(any());
     }
 
     @Test

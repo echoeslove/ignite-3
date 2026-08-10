@@ -17,6 +17,7 @@
 
 package org.apache.ignite.internal.compute.loader;
 
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /**
@@ -27,6 +28,8 @@ public class JobContext implements AutoCloseable {
     private final JobClassLoader classLoader;
 
     private final Consumer<JobContext> onClose;
+
+    private final AtomicBoolean closed = new AtomicBoolean();
 
     public JobContext(JobClassLoader classLoader, Consumer<JobContext> onClose) {
         this.classLoader = classLoader;
@@ -39,6 +42,8 @@ public class JobContext implements AutoCloseable {
 
     @Override
     public void close() {
-        onClose.accept(this);
+        if (closed.compareAndSet(false, true)) {
+            onClose.accept(this);
+        }
     }
 }

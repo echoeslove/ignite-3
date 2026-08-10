@@ -22,6 +22,7 @@ import static org.apache.ignite.internal.deployunit.DeploymentStatus.REMOVING;
 
 import java.util.List;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.apache.ignite.deployment.DeploymentUnit;
 import org.apache.ignite.deployment.version.Version;
@@ -44,6 +45,8 @@ public class DefaultNodeCallback extends NodeEventCallback {
 
     private final ClusterManagementGroupManager cmgManager;
 
+    private final Consumer<DeploymentUnit> onObsolete;
+
     /**
      * Constructor.
      *
@@ -51,17 +54,20 @@ public class DefaultNodeCallback extends NodeEventCallback {
      * @param undeployer Deployment unit undeployer.
      * @param downloader Unit downloader.
      * @param cmgManager Cluster management group manager.
+     * @param onObsolete Callback invoked before waiting for acquired deployment units to be released.
      */
     DefaultNodeCallback(
             DeploymentUnitStore deploymentUnitStore,
             DeploymentUnitAcquiredWaiter undeployer,
             UnitDownloader downloader,
-            ClusterManagementGroupManager cmgManager
+            ClusterManagementGroupManager cmgManager,
+            Consumer<DeploymentUnit> onObsolete
     ) {
         this.deploymentUnitStore = deploymentUnitStore;
         this.undeployer = undeployer;
         this.downloader = downloader;
         this.cmgManager = cmgManager;
+        this.onObsolete = onObsolete;
     }
 
     @Override
@@ -84,7 +90,10 @@ public class DefaultNodeCallback extends NodeEventCallback {
 
     @Override
     public void onObsolete(String id, Version version, List<UnitNodeStatus> holders) {
-        undeployer.submitToAcquireRelease(new DeploymentUnit(id, version));
+        DeploymentUnit unit = new DeploymentUnit(id, version);
+
+        onObsolete.accept(unit);
+        undeployer.submitToAcquireRelease(unit);
     }
 
     @Override

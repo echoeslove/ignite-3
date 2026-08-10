@@ -1253,12 +1253,22 @@ public class IgniteImpl implements Ignite {
         );
         deploymentManager = deploymentManagerImpl;
 
+        JobContextManager jobContextManager = new JobContextManager(
+                deploymentManagerImpl,
+                deploymentManagerImpl.deploymentUnitAccessor(),
+                new JobClassLoaderFactory(),
+                computeCfg,
+                threadPoolsManager.commonScheduler()
+        );
+
+        deploymentManagerImpl.registerUnitObsoleteListener(jobContextManager::invalidate);
+
         computeComponent = new ComputeComponentImpl(
                 name,
                 clusterSvc.messagingService(),
                 clusterSvc.topologyService(),
                 logicalTopologyService,
-                new JobContextManager(deploymentManagerImpl, deploymentManagerImpl.deploymentUnitAccessor(), new JobClassLoaderFactory()),
+                jobContextManager,
                 computeExecutor,
                 computeCfg,
                 eventLog
