@@ -288,6 +288,8 @@ public class ItTxTestCluster {
 
     private final Map<String, Map<ZonePartitionId, ZonePartitionRaftListener>> zonePartitionRaftGroupListeners = new HashMap<>();
 
+    private final Map<String, Map<ZonePartitionId, SafeTimeValuesTracker>> safeTimeTrackers = new ConcurrentHashMap<>();
+
     private final Map<String, Map<ZonePartitionId, ZonePartitionReplicaListener>> zonePartitionReplicaListeners = new HashMap<>();
 
     private final ClusterNodeResolver nodeResolver = new ClusterNodeResolver() {
@@ -747,7 +749,13 @@ public class ItTxTestCluster {
 
                 IndexLocker pkLocker = new HashIndexLocker(indexId, true, txManagers.get(assignment).lockManager(), row2Tuple);
 
-                SafeTimeValuesTracker safeTime = new SafeTimeValuesTracker(HybridTimestamp.MIN_VALUE);
+                SafeTimeValuesTracker safeTime = colocationEnabled()
+                        ? safeTimeTrackers.computeIfAbsent(assignment, key -> new ConcurrentHashMap<>())
+                                .computeIfAbsent(
+                                        new ZonePartitionId(predefinedZoneId, partId),
+                                        key -> new SafeTimeValuesTracker(HybridTimestamp.MIN_VALUE)
+                                )
+                        : new SafeTimeValuesTracker(HybridTimestamp.MIN_VALUE);
                 PendingComparableValuesTracker<Long, Void> storageIndexTracker = new PendingComparableValuesTracker<>(0L);
 
                 PartitionDataStorage partitionDataStorage = new TestPartitionDataStorage(tableId, partId, mvPartStorage);
@@ -899,7 +907,6 @@ public class ItTxTestCluster {
                     partitionDataStorage,
                     storageUpdateHandler,
                     txStateStorage,
-                    safeTimeTracker,
                     storageIndexTracker,
                     catalogService,
                     schemaRegistry,

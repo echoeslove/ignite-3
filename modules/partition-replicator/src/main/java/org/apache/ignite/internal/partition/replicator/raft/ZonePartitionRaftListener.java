@@ -19,6 +19,7 @@ package org.apache.ignite.internal.partition.replicator.raft;
 
 import static java.lang.Math.max;
 import static org.apache.ignite.internal.partition.replicator.raft.CommandResult.EMPTY_APPLIED_RESULT;
+import static org.apache.ignite.internal.partition.replicator.raft.CommandResult.EMPTY_NOT_APPLIED_RESULT;
 import static org.apache.ignite.internal.tx.message.TxMessageGroup.VACUUM_TX_STATE_COMMAND;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
@@ -208,7 +209,7 @@ public class ZonePartitionRaftListener implements RaftGroupListener {
                 } else if (command instanceof UpdateMinimumActiveTxBeginTimeCommand) {
                     result = processCrossTableProcessorsCommand(command, commandIndex, commandTerm, safeTimestamp);
                 } else if (command instanceof SafeTimeSyncCommand) {
-                    result = processCrossTableProcessorsCommand(command, commandIndex, commandTerm, safeTimestamp);
+                    result = handleSafeTimeSyncCommand(commandIndex, commandTerm);
                 } else if (command instanceof PrimaryReplicaChangeCommand) {
                     result = processCrossTableProcessorsCommand(command, commandIndex, commandTerm, safeTimestamp);
 
@@ -326,6 +327,24 @@ public class ZonePartitionRaftListener implements RaftGroupListener {
         txStateStorage.leaseInfo(leaseInfo, commandIndex, commandTerm);
 
         return true;
+    }
+
+    /**
+     * Handler for the {@link SafeTimeSyncCommand}.
+     *
+     * @param commandIndex RAFT index of the command.
+     * @param commandTerm RAFT term of the command.
+     */
+    private CommandResult handleSafeTimeSyncCommand(long commandIndex, long commandTerm) {
+        if (commandIndex <= txStateStorage.lastAppliedIndex()) {
+            return EMPTY_NOT_APPLIED_RESULT;
+        }
+
+        // We MUST bump information about last updated index+term in one underlying storage.
+        // See the comment in processWriteCommand for explanation.
+        txStateStorage.lastApplied(commandIndex, commandTerm);
+
+        return EMPTY_APPLIED_RESULT;
     }
 
     @Override

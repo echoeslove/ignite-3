@@ -393,7 +393,6 @@ class ItZonePartitionRaftListenerRecoveryTest extends IgniteAbstractTest {
                 storage,
                 storageUpdateHandler,
                 txStateStorage.getOrCreatePartitionStorage(PARTITION_ID.partitionId()),
-                new SafeTimeValuesTracker(HybridTimestamp.MIN_VALUE),
                 new PendingComparableValuesTracker<>(0L),
                 catalogService,
                 schemaRegistry,

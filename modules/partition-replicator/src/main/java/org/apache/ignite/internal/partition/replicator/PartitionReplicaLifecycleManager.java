@@ -161,6 +161,7 @@ import org.apache.ignite.internal.util.Cursor;
 import org.apache.ignite.internal.util.IgniteSpinBusyLock;
 import org.apache.ignite.internal.util.IgniteUtils;
 import org.apache.ignite.internal.util.PendingComparableValuesTracker;
+import org.apache.ignite.internal.util.SafeTimeValuesTracker;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.TestOnly;
 import org.jetbrains.annotations.VisibleForTesting;
@@ -690,21 +691,19 @@ public class PartitionReplicaLifecycleManager extends
 
         Supplier<CompletableFuture<Boolean>> startReplicaSupplier = () -> {
             var storageIndexTracker = new PendingComparableValuesTracker<Long, Void>(0L);
+            var safeTimeTracker = new SafeTimeValuesTracker(HybridTimestamp.MIN_VALUE);
             var eventParams = new LocalPartitionReplicaEventParameters(zonePartitionId, revision, onRecovery);
 
             ZonePartitionResources zoneResources = zoneResourcesManager.allocateZonePartitionResources(
                     zonePartitionId,
                     partitionCount,
+                    safeTimeTracker,
                     storageIndexTracker
             );
 
             return fireEvent(LocalPartitionReplicaEvent.BEFORE_REPLICA_STARTED, eventParams)
                     .thenCompose(v -> {
                         try {
-                            // TODO https://issues.apache.org/jira/browse/IGNITE-24654 Properly close storageIndexTracker.
-                            //  internalTbl.updatePartitionTrackers is used in order to add storageIndexTracker to some context for further
-                            //  storage closing.
-                            // internalTbl.updatePartitionTrackers(partId, safeTimeTracker, storageIndexTracker);
                             return replicaMgr.startReplica(
                                     zonePartitionId,
                                     raftClient -> {
@@ -1207,7 +1206,17 @@ public class PartitionReplicaLifecycleManager extends
         return replicaMgr.weakStopReplica(
                 zonePartitionId,
                 WeakReplicaStopReason.RESTART,
-                () -> stopPartitionInternal(zonePartitionId, BEFORE_REPLICA_STOPPED, AFTER_REPLICA_STOPPED, revision, replica -> {})
+                () -> stopPartitionInternal(
+                        zonePartitionId,
+                        BEFORE_REPLICA_STOPPED,
+                        AFTER_REPLICA_STOPPED,
+                        revision,
+                        replicaWasStopped -> {
+                            if (replicaWasStopped) {
+                                zoneResourcesManager.removeZonePartitionResources(zonePartitionId);
+                            }
+                        }
+                )
         );
     }
 
@@ -1666,7 +1675,11 @@ public class PartitionReplicaLifecycleManager extends
                         BEFORE_REPLICA_STOPPED,
                         AFTER_REPLICA_STOPPED,
                         -1L,
-                        replicaWasStopped -> {}
+                        replicaWasStopped -> {
+                            if (replicaWasStopped) {
+                                zoneResourcesManager.removeZonePartitionResources(zonePartitionId);
+                            }
+                        }
                 ))
                 .toArray(CompletableFuture[]::new);
 

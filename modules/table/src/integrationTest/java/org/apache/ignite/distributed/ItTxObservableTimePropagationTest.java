@@ -38,14 +38,12 @@ import org.apache.ignite.internal.raft.Loza;
 import org.apache.ignite.internal.raft.server.impl.JraftServerImpl;
 import org.apache.ignite.internal.raft.server.impl.JraftServerImpl.DelegatingStateMachine;
 import org.apache.ignite.internal.replicator.ReplicationGroupId;
-import org.apache.ignite.internal.table.TableViewInternal;
 import org.apache.ignite.internal.table.TxInfrastructureTest;
 import org.apache.ignite.internal.table.distributed.raft.PartitionListener;
 import org.apache.ignite.internal.testframework.IgniteTestUtils;
 import org.apache.ignite.internal.testframework.SystemPropertiesExtension;
 import org.apache.ignite.internal.testframework.WithSystemProperty;
 import org.apache.ignite.internal.tx.TxStateMeta;
-import org.apache.ignite.internal.util.PendingComparableValuesTracker;
 import org.apache.ignite.raft.jraft.Status;
 import org.apache.ignite.raft.jraft.core.NodeImpl;
 import org.apache.ignite.table.RecordView;
@@ -139,17 +137,14 @@ public class ItTxObservableTimePropagationTest extends TxInfrastructureTest {
                 }
 
                 var fsm = (JraftServerImpl.DelegatingStateMachine) raftNode.getOptions().getFsm();
-                PartitionListener listener = extractPartitionListener(fsm, accounts);
-                PendingComparableValuesTracker<HybridTimestamp, Void> safeTime = listener.getSafeTimeTracker();
-
                 try {
-                    assertTrue(IgniteTestUtils.waitForCondition(() -> safeTime.current().equals(commitTs), 30_000),
+                    assertTrue(IgniteTestUtils.waitForCondition(() -> currentSafeTime(fsm).equals(commitTs), 30_000),
                             "Safe ts is not propagated to replica " + raftNode.getNodeId());
                 } catch (InterruptedException e) {
                     fail("Unexpected interrupt");
                 }
 
-                LOG.info("DBG: node={}, group={}, safeTs={}", raftNode.getNodeId(), raftNode.getGroupId(), safeTime.current());
+                LOG.info("DBG: node={}, group={}, safeTs={}", raftNode.getNodeId(), raftNode.getGroupId(), currentSafeTime(fsm));
             });
         });
 
@@ -173,11 +168,11 @@ public class ItTxObservableTimePropagationTest extends TxInfrastructureTest {
         assertTrue(commitTs2.compareTo(commitTs) > 0, "Invalid safe time");
     }
 
-    private static PartitionListener extractPartitionListener(DelegatingStateMachine fsm, TableViewInternal table) {
+    private static HybridTimestamp currentSafeTime(DelegatingStateMachine fsm) {
         if (colocationEnabled()) {
-            return (PartitionListener) ((ZonePartitionRaftListener) fsm.getListener()).tableProcessor(table.tableId());
+            return ((ZonePartitionRaftListener) fsm.getListener()).currentSafeTime();
         } else {
-            return (PartitionListener) fsm.getListener();
+            return ((PartitionListener) fsm.getListener()).getSafeTimeTracker().current();
         }
     }
 }

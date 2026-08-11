@@ -9,6 +9,8 @@ RUNTIME_ROOT="${VALIDATION_ROOT}/runtime"
 CLI_STATE_HOME="${VALIDATION_ROOT}/cli-home"
 CLUSTER_NAME="job-classloader-cache-validation"
 ACTION="${1:-start}"
+USE_LAUNCHCTL="${IGNITE_USE_LAUNCHCTL:-true}"
+PORT_OFFSET="${IGNITE_PORT_OFFSET:-0}"
 
 if [[ ! -f "${ARTIFACT_MANIFEST}" ]]; then
     echo "ERROR: Build manifest not found. Run 01-build-ignite.sh first." >&2
@@ -27,15 +29,15 @@ if [[ "${JAVA_MAJOR}" != "25" ]]; then
 fi
 
 node_rest_port() {
-    echo $((10299 + $1))
+    echo $((10299 + PORT_OFFSET + $1))
 }
 
 node_client_port() {
-    echo $((10799 + $1))
+    echo $((10799 + PORT_OFFSET + $1))
 }
 
 node_network_port() {
-    echo $((3343 + $1))
+    echo $((3343 + PORT_OFFSET + $1))
 }
 
 node_dir() {
@@ -77,7 +79,7 @@ wait_for_logical_topology() {
 
     for _ in $(seq 1 120); do
         local json
-        json="$(curl -fsS http://127.0.0.1:10300/management/v1/cluster/topology/logical 2>/dev/null || true)"
+        json="$(curl -fsS "http://127.0.0.1:$(node_rest_port 1)/management/v1/cluster/topology/logical" 2>/dev/null || true)"
         if [[ -n "${json}" ]] && JSON="${json}" EXPECTED="${expected}" python3 -c \
             'import json,os,sys; data=json.loads(os.environ["JSON"]); sys.exit(0 if len(data)==int(os.environ["EXPECTED"]) else 1)' 2>/dev/null; then
             return 0
@@ -95,7 +97,7 @@ stop_node() {
     file="$(pid_file "${index}")"
 
     if [[ ! -f "${file}" ]]; then
-        if [[ "$(uname -s)" == "Darwin" ]]; then
+        if [[ "$(uname -s)" == "Darwin" && "${USE_LAUNCHCTL}" == "true" ]]; then
             launchctl remove "$(launch_label "${index}")" >/dev/null 2>&1 || true
         fi
         echo "node${index}: no PID file"
@@ -106,7 +108,7 @@ stop_node() {
     pid="$(tr -d '[:space:]' < "${file}")"
 
     if ! kill -0 "${pid}" 2>/dev/null; then
-        if [[ "$(uname -s)" == "Darwin" ]]; then
+        if [[ "$(uname -s)" == "Darwin" && "${USE_LAUNCHCTL}" == "true" ]]; then
             launchctl remove "$(launch_label "${index}")" >/dev/null 2>&1 || true
         fi
         echo "node${index}: stale PID ${pid}"
@@ -119,7 +121,7 @@ stop_node() {
         return 1
     fi
 
-    if [[ "$(uname -s)" == "Darwin" ]]; then
+    if [[ "$(uname -s)" == "Darwin" && "${USE_LAUNCHCTL}" == "true" ]]; then
         launchctl remove "$(launch_label "${index}")"
     else
         kill "${pid}"
@@ -164,7 +166,7 @@ start_node() {
     fi
 
     mkdir -p "${dir}/run" "${dir}/log"
-    if [[ "$(uname -s)" == "Darwin" ]]; then
+    if [[ "$(uname -s)" == "Darwin" && "${USE_LAUNCHCTL}" == "true" ]]; then
         local label
         label="$(launch_label "${index}")"
         launchctl remove "${label}" >/dev/null 2>&1 || true
@@ -222,9 +224,9 @@ ignite {
     network {
         port: ${network_port}
         nodeFinder.netClusterNodes: [
-            "127.0.0.1:3344",
-            "127.0.0.1:3345",
-            "127.0.0.1:3346"
+            "127.0.0.1:$(node_network_port 1)",
+            "127.0.0.1:$(node_network_port 2)",
+            "127.0.0.1:$(node_network_port 3)"
         ]
     }
     clientConnector.port: ${client_port}
@@ -237,9 +239,9 @@ ignite {
     network {
         port: ${network_port}
         nodeFinder.netClusterNodes: [
-            "127.0.0.1:3344",
-            "127.0.0.1:3345",
-            "127.0.0.1:3346"
+            "127.0.0.1:$(node_network_port 1)",
+            "127.0.0.1:$(node_network_port 2)",
+            "127.0.0.1:$(node_network_port 3)"
         ]
     }
     clientConnector.port: ${client_port}
@@ -308,7 +310,7 @@ show_status() {
     fi
 
     local topology
-    topology="$(curl -fsS http://127.0.0.1:10300/management/v1/cluster/topology/logical)"
+    topology="$(curl -fsS "http://127.0.0.1:$(node_rest_port 1)/management/v1/cluster/topology/logical")"
     echo "logicalTopology=${topology}"
     JSON="${topology}" python3 -c 'import json,os,sys; data=json.loads(os.environ["JSON"]); sys.exit(0 if len(data)==3 else 1)'
 }
@@ -319,7 +321,8 @@ case "${ACTION}" in
         for index in 1 2 3; do
             start_node "${index}"
         done
-        run_cli cluster init --url http://127.0.0.1:10300 --name "${CLUSTER_NAME}" \
+        sleep 2
+        run_cli cluster init --url "http://127.0.0.1:$(node_rest_port 1)" --name "${CLUSTER_NAME}" \
             --cluster-management-group node1,node2,node3 \
             --metastorage-group node1,node2,node3
         wait_for_logical_topology 3

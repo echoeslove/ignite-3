@@ -147,8 +147,7 @@ class ZonePartitionRaftListenerTest extends BaseIgniteAbstractTest {
     @InjectExecutorService
     private ExecutorService executor;
 
-    @Mock
-    private SafeTimeValuesTracker safeTimeTracker;
+    private final SafeTimeValuesTracker safeTimeTracker = new SafeTimeValuesTracker(HybridTimestamp.MIN_VALUE);
 
     private final HybridClock clock = new HybridClockImpl();
 
@@ -162,7 +161,7 @@ class ZonePartitionRaftListenerTest extends BaseIgniteAbstractTest {
                 new ZonePartitionId(ZONE_ID, PARTITION_ID),
                 txStatePartitionStorage,
                 txManager,
-                new SafeTimeValuesTracker(HybridTimestamp.MIN_VALUE),
+                safeTimeTracker,
                 new PendingComparableValuesTracker<>(0L),
                 outgoingSnapshotsManager,
                 executor
@@ -488,7 +487,8 @@ class ZonePartitionRaftListenerTest extends BaseIgniteAbstractTest {
 
         verify(txStatePartitionStorage, never())
                 .compareAndSet(any(UUID.class), any(TxState.class), any(TxMeta.class), anyLong(), anyLong());
-        verify(txStatePartitionStorage, times(1)).lastApplied(anyLong(), anyLong());
+        // Once for the SafeTimeSyncCommand and once for setting up the TxStateStorage boundary above.
+        verify(txStatePartitionStorage, times(2)).lastApplied(anyLong(), anyLong());
 
         assertThat(commandClosureResultCaptor.getAllValues(), containsInAnyOrder(new Throwable[]{null, null}));
 
@@ -511,6 +511,29 @@ class ZonePartitionRaftListenerTest extends BaseIgniteAbstractTest {
 
         assertThat(txStatePartitionStorage.lastAppliedIndex(), is(3L));
         assertThat(txStatePartitionStorage.lastAppliedTerm(), is(2L));
+    }
+
+    @Test
+    void handlesSafeTimeSyncCommandsOnZoneLevel() {
+        var tableProcessor = new TestRaftTableProcessor();
+
+        listener.addTableProcessor(TABLE_ID, tableProcessor);
+
+        HybridTimestamp safeTime = clock.now();
+
+        SafeTimeSyncCommand command = REPLICA_MESSAGES_FACTORY.safeTimeSyncCommand()
+                .initiatorTime(clock.now())
+                .safeTime(safeTime)
+                .build();
+
+        listener.onWrite(List.of(
+                writeCommandClosure(3, 2, command, null, safeTime)
+        ).iterator());
+
+        assertThat(txStatePartitionStorage.lastAppliedIndex(), is(3L));
+        assertThat(txStatePartitionStorage.lastAppliedTerm(), is(2L));
+        assertThat(tableProcessor.lastAppliedIndex(), is(0L));
+        assertThat(listener.currentSafeTime(), is(safeTime));
     }
 
     private CommandClosure<WriteCommand> writeCommandClosure(

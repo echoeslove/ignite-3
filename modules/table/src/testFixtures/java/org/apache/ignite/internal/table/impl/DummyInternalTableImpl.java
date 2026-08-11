@@ -532,24 +532,46 @@ public class DummyInternalTableImpl extends InternalTableImpl {
         lenient().when(clockService.current()).thenReturn(clock.current());
 
         PendingComparableValuesTracker<Long, Void> storageIndexTracker = new PendingComparableValuesTracker<>(0L);
-        var tablePartitionListener = new PartitionListener(
-                this.txManager,
-                new TestPartitionDataStorage(tableId, PART_ID, mvPartStorage),
-                storageUpdateHandler,
-                txStateStorage().getOrCreatePartitionStorage(PART_ID),
-                safeTime,
-                storageIndexTracker,
-                catalogService,
-                schemaManager,
-                mock(IndexMetaStorage.class),
-                LOCAL_NODE.id(),
-                mock(MinimumRequiredTimeCollectorService.class),
-                mock(Executor.class),
-                placementDriver,
-                clockService,
-                new SystemPropertiesNodeProperties(),
-                enabledColocation ? zonePartitionId : tablePartitionId
-        );
+        PartitionListener tablePartitionListener;
+
+        if (enabledColocation) {
+            tablePartitionListener = new PartitionListener(
+                    this.txManager,
+                    new TestPartitionDataStorage(tableId, PART_ID, mvPartStorage),
+                    storageUpdateHandler,
+                    txStateStorage().getOrCreatePartitionStorage(PART_ID),
+                    storageIndexTracker,
+                    catalogService,
+                    schemaManager,
+                    mock(IndexMetaStorage.class),
+                    LOCAL_NODE.id(),
+                    mock(MinimumRequiredTimeCollectorService.class),
+                    mock(Executor.class),
+                    placementDriver,
+                    clockService,
+                    new SystemPropertiesNodeProperties(),
+                    zonePartitionId
+            );
+        } else {
+            tablePartitionListener = new PartitionListener(
+                    this.txManager,
+                    new TestPartitionDataStorage(tableId, PART_ID, mvPartStorage),
+                    storageUpdateHandler,
+                    txStateStorage().getOrCreatePartitionStorage(PART_ID),
+                    safeTime,
+                    storageIndexTracker,
+                    catalogService,
+                    schemaManager,
+                    mock(IndexMetaStorage.class),
+                    LOCAL_NODE.id(),
+                    mock(MinimumRequiredTimeCollectorService.class),
+                    mock(Executor.class),
+                    placementDriver,
+                    clockService,
+                    new SystemPropertiesNodeProperties(),
+                    tablePartitionId
+            );
+        }
 
         if (enabledColocation) {
             ZonePartitionRaftListener zoneRaftListener = new ZonePartitionRaftListener(

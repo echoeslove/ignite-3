@@ -74,6 +74,7 @@ import org.apache.ignite.internal.raft.service.CommandClosure;
 import org.apache.ignite.internal.raft.service.RaftGroupListener;
 import org.apache.ignite.internal.replicator.ReplicationGroupId;
 import org.apache.ignite.internal.replicator.TablePartitionId;
+import org.apache.ignite.internal.replicator.ZonePartitionId;
 import org.apache.ignite.internal.replicator.command.SafeTimePropagatingCommand;
 import org.apache.ignite.internal.replicator.command.SafeTimeSyncCommand;
 import org.apache.ignite.internal.replicator.message.PrimaryReplicaChangeCommand;
@@ -116,7 +117,7 @@ public class PartitionListener implements RaftGroupListener, RaftTableProcessor 
     private final TxStatePartitionStorage txStatePartitionStorage;
 
     /** Safe time tracker. */
-    private final SafeTimeValuesTracker safeTimeTracker;
+    private final @Nullable SafeTimeValuesTracker safeTimeTracker;
 
     /** Storage index tracker. */
     private final PendingComparableValuesTracker<Long, Void> storageIndexTracker;
@@ -149,7 +150,48 @@ public class PartitionListener implements RaftGroupListener, RaftTableProcessor 
 
     private ReplicaMeta lastKnownLease;
 
-    /** Constructor. */
+    /**
+     * Constructor for a table processor owned by a zone-partition Raft listener.
+     * Safe time is advanced once by the owning zone listener, not by every table processor.
+     */
+    public PartitionListener(
+            TxManager txManager,
+            PartitionDataStorage partitionDataStorage,
+            StorageUpdateHandler storageUpdateHandler,
+            TxStatePartitionStorage txStatePartitionStorage,
+            PendingComparableValuesTracker<Long, Void> storageIndexTracker,
+            CatalogService catalogService,
+            SchemaRegistry schemaRegistry,
+            IndexMetaStorage indexMetaStorage,
+            UUID localNodeId,
+            MinimumRequiredTimeCollectorService minTimeCollectorService,
+            Executor partitionOperationsExecutor,
+            LeasePlacementDriver placementDriver,
+            ClockService clockService,
+            NodeProperties nodeProperties,
+            ZonePartitionId zonePartitionId
+    ) {
+        this(
+                txManager,
+                partitionDataStorage,
+                storageUpdateHandler,
+                txStatePartitionStorage,
+                null,
+                storageIndexTracker,
+                catalogService,
+                schemaRegistry,
+                indexMetaStorage,
+                localNodeId,
+                minTimeCollectorService,
+                partitionOperationsExecutor,
+                placementDriver,
+                clockService,
+                nodeProperties,
+                zonePartitionId
+        );
+    }
+
+    /** Constructor for a standalone table-partition Raft listener. */
     public PartitionListener(
             TxManager txManager,
             PartitionDataStorage partitionDataStorage,
@@ -334,7 +376,7 @@ public class PartitionListener implements RaftGroupListener, RaftTableProcessor 
             result = handleUpdateAllCommand((UpdateAllCommand) command, commandIndex, commandTerm, safeTimestamp);
         } else if (command instanceof WriteIntentSwitchCommand) {
             result = handleWriteIntentSwitchCommand((WriteIntentSwitchCommand) command, commandIndex, commandTerm);
-        } else if (command instanceof SafeTimeSyncCommand) {
+        } else if (command instanceof SafeTimeSyncCommand && safeTimeTracker != null) {
             result = handleSafeTimeSyncCommand((SafeTimeSyncCommand) command, commandIndex, commandTerm);
         } else if (command instanceof PrimaryReplicaChangeCommand) {
             result = handlePrimaryReplicaChangeCommand((PrimaryReplicaChangeCommand) command, commandIndex, commandTerm);
@@ -346,7 +388,7 @@ public class PartitionListener implements RaftGroupListener, RaftTableProcessor 
 
         if (result.wasApplied()) {
             // Adjust safe time before completing update to reduce waiting.
-            if (safeTimestamp != null) {
+            if (safeTimestamp != null && safeTimeTracker != null) {
                 updateTrackerIgnoringTrackerClosedException(safeTimeTracker, safeTimestamp);
             }
 
@@ -719,6 +761,8 @@ public class PartitionListener implements RaftGroupListener, RaftTableProcessor 
      */
     @TestOnly
     public PendingComparableValuesTracker<HybridTimestamp, Void> getSafeTimeTracker() {
+        assert safeTimeTracker != null : "Zone table processors do not own a safe time tracker";
+
         return safeTimeTracker;
     }
 
