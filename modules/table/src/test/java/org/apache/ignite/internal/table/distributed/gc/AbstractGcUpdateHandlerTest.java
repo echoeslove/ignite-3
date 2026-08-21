@@ -19,22 +19,23 @@ package org.apache.ignite.internal.table.distributed.gc;
 
 import static java.util.stream.Collectors.toList;
 import static org.apache.ignite.internal.testframework.IgniteTestUtils.runRace;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
-import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.stream.IntStream;
 import org.apache.ignite.distributed.TestPartitionDataStorage;
@@ -104,6 +105,74 @@ abstract class AbstractGcUpdateHandlerTest extends BaseMvStoragesTest {
         assertTrue(gcUpdateHandler.vacuumBatch(lowWatermark, 1));
         verify(partitionStorage).peek(eq(lowWatermark), eq(1));
         verify(indexUpdateHandler).tryRemoveFromIndexes(any(), eq(rowId), any(), isNull());
+    }
+
+    // Hotfix2 downstream regression coverage; not part of upstream IGNITE-26995, IGNITE-26996, or IGNITE-26998.
+    @Test
+    void testVacuumBatchStatistics() {
+        TestPartitionDataStorage partitionStorage = createPartitionDataStorage();
+        IndexUpdateHandler indexUpdateHandler = Mockito.mock(IndexUpdateHandler.class);
+
+        Mockito.doAnswer(invocation -> {
+            Cursor<ReadResult> previousValues = invocation.getArgument(2);
+
+            while (previousValues.hasNext()) {
+                previousValues.next();
+            }
+
+            return null;
+        }).when(indexUpdateHandler).tryRemoveFromIndexes(any(), any(), any(), isNull());
+
+        RowId rowId = new RowId(PARTITION_ID);
+        BinaryRow row = binaryRow(new TestKey(0, "key"), new TestValue(0, "value"));
+
+        addWriteCommitted(partitionStorage, rowId, row, clock.now());
+        addWriteCommitted(partitionStorage, rowId, row, clock.now());
+
+        GcUpdateHandler.GcBatchResult result = vacuumBatchResult(
+                createGcUpdateHandler(partitionStorage, indexUpdateHandler),
+                HybridTimestamp.MAX_VALUE,
+                1
+        );
+
+        assertTrue(result.garbageLeft());
+        assertEquals(1, result.requestedEntries);
+        assertEquals(1, result.peekedEntries);
+        assertEquals(1, result.vacuumedEntries);
+        assertEquals(1, result.versionsScanned);
+        assertFalse(result.yieldedToCheckpoint);
+        assertEquals(0, result.removedByAnotherThread);
+    }
+
+    @Test
+    void testVacuumBatchContinuesAfterEntryWasRemovedByAnotherThread() {
+        TestPartitionDataStorage partitionStorage = spy(createPartitionDataStorage());
+        AtomicBoolean firstVacuum = new AtomicBoolean(true);
+
+        Mockito.doAnswer(invocation -> {
+            BinaryRow removedRow = (BinaryRow) invocation.callRealMethod();
+
+            return firstVacuum.getAndSet(false) ? null : removedRow;
+        }).when(partitionStorage).vacuum(any());
+
+        for (int i = 0; i < 2; i++) {
+            RowId rowId = new RowId(PARTITION_ID);
+            BinaryRow row = binaryRow(new TestKey(i, "key" + i), new TestValue(i, "value" + i));
+
+            addWriteCommitted(partitionStorage, rowId, row, clock.now());
+            addWriteCommitted(partitionStorage, rowId, row, clock.now());
+        }
+
+        GcUpdateHandler.GcBatchResult result = vacuumBatchResult(
+                createGcUpdateHandler(partitionStorage, createIndexUpdateHandler()),
+                HybridTimestamp.MAX_VALUE,
+                2
+        );
+
+        assertFalse(result.garbageLeft());
+        assertEquals(1, result.removedByAnotherThread);
+        assertEquals(1, result.vacuumedEntries);
+        verify(partitionStorage, times(2)).vacuum(any());
     }
 
     @Test
@@ -253,23 +322,15 @@ abstract class AbstractGcUpdateHandlerTest extends BaseMvStoragesTest {
         }
     }
 
-    /**
-     * Tests that {@link GcUpdateHandler#vacuumBatch} exits early when {@code shouldRelease()} returns {@code true}.
-     *
-     * <p>This test verifies that the vacuum process can be interrupted mid-execution by the {@code shouldRelease()}
-     * mechanism, which is used to allow other operations (like rebalancing) to acquire necessary locks.
-     */
+    // Hotfix2 downstream checkpoint-yield coverage; not part of the three upstream Hotfix2 issues.
     @Test
-    void testShouldReleaseExitsEarly() {
-        // Given: A partition storage with controllable shouldRelease() behavior
-        BooleanSupplier shouldReleaseSupplier = Mockito.mock();
+    void testShouldReleaseExitsBeforeFirstEntry() {
+        AtomicInteger shouldReleaseChecks = new AtomicInteger();
+        BooleanSupplier shouldReleaseSupplier = () -> shouldReleaseChecks.getAndIncrement() == 0;
         TestPartitionDataStorage partitionStorage = createTestMvPartitionStorage(shouldReleaseSupplier);
-        IndexUpdateHandler indexUpdateHandler = createIndexUpdateHandler();
-        GcUpdateHandler gcUpdateHandler = createGcUpdateHandler(partitionStorage, indexUpdateHandler);
-
+        GcUpdateHandler gcUpdateHandler = createGcUpdateHandler(partitionStorage, createIndexUpdateHandler());
         HybridTimestamp lowWatermark = HybridTimestamp.MAX_VALUE;
 
-        // Given: Multiple rows with garbage to collect (20 rows with 2 versions each)
         for (int i = 0; i < 10; i++) {
             RowId rowId = new RowId(PARTITION_ID);
             BinaryRow row = binaryRow(new TestKey(i, "key" + i), new TestValue(i, "value" + i));
@@ -278,21 +339,65 @@ abstract class AbstractGcUpdateHandlerTest extends BaseMvStoragesTest {
             addWriteCommitted(partitionStorage, rowId, row, clock.now());
         }
 
-        // When: Vacuum runs with shouldRelease() returning true (simulating lock contention)
-        when(shouldReleaseSupplier.getAsBoolean()).thenReturn(true);
-        boolean hasGarbageLeft = gcUpdateHandler.vacuumBatch(lowWatermark, 10);
+        GcUpdateHandler.GcBatchResult yieldedResult = vacuumBatchResult(gcUpdateHandler, lowWatermark, 10);
 
-        // Then: Vacuum exits early and reports garbage remaining
-        assertTrue(hasGarbageLeft, "Expected garbage to remain after early exit");
-        verify(shouldReleaseSupplier).getAsBoolean();
+        assertTrue(yieldedResult.garbageLeft());
+        assertTrue(yieldedResult.yieldedToCheckpoint);
+        assertEquals(0, yieldedResult.vacuumedEntries);
 
-        // When: Vacuum runs again with shouldRelease() returning false
-        when(shouldReleaseSupplier.getAsBoolean()).thenReturn(false);
-        hasGarbageLeft = gcUpdateHandler.vacuumBatch(lowWatermark, 100);
+        GcUpdateHandler.GcBatchResult completedResult = vacuumBatchResult(gcUpdateHandler, lowWatermark, 100);
 
-        // Then: All remaining garbage is processed
-        assertFalse(hasGarbageLeft, "Expected no garbage left after completing vacuum");
-        verify(shouldReleaseSupplier, atLeastOnce()).getAsBoolean();
+        assertFalse(completedResult.garbageLeft());
+        assertEquals(10, completedResult.vacuumedEntries);
+    }
+
+    /**
+     * Hotfix2 downstream regression test, not part of upstream IGNITE-26995, IGNITE-26996, or IGNITE-26998.
+     *
+     * <p>Verifies that {@link GcUpdateHandler#vacuumBatch} can be interrupted mid-execution by the {@code shouldRelease()}
+     * mechanism, which is used to allow other operations (like rebalancing) to acquire necessary locks.
+     */
+    @Test
+    void testShouldReleaseExitsEarly() {
+        AtomicInteger shouldReleaseChecks = new AtomicInteger();
+        BooleanSupplier shouldReleaseSupplier = () -> shouldReleaseChecks.incrementAndGet() == 2;
+        TestPartitionDataStorage partitionStorage = createTestMvPartitionStorage(shouldReleaseSupplier);
+        IndexUpdateHandler indexUpdateHandler = createIndexUpdateHandler();
+        GcUpdateHandler gcUpdateHandler = createGcUpdateHandler(partitionStorage, indexUpdateHandler);
+
+        HybridTimestamp lowWatermark = HybridTimestamp.MAX_VALUE;
+
+        for (int i = 0; i < 10; i++) {
+            RowId rowId = new RowId(PARTITION_ID);
+            BinaryRow row = binaryRow(new TestKey(i, "key" + i), new TestValue(i, "value" + i));
+
+            addWriteCommitted(partitionStorage, rowId, row, clock.now());
+            addWriteCommitted(partitionStorage, rowId, row, clock.now());
+        }
+
+        GcUpdateHandler.GcBatchResult yieldedResult = vacuumBatchResult(gcUpdateHandler, lowWatermark, 10);
+
+        assertTrue(yieldedResult.garbageLeft(), "Expected garbage to remain after mid-batch yield");
+        assertTrue(yieldedResult.yieldedToCheckpoint);
+        assertEquals(1, yieldedResult.vacuumedEntries, "One entry must be processed before yielding");
+
+        GcUpdateHandler.GcBatchResult completedResult = vacuumBatchResult(gcUpdateHandler, lowWatermark, 100);
+
+        assertFalse(completedResult.garbageLeft(), "Expected no garbage left after completing vacuum");
+        assertEquals(9, completedResult.vacuumedEntries, "Every unprocessed entry must remain available after yielding");
+        assertEquals(10, yieldedResult.vacuumedEntries + completedResult.vacuumedEntries);
+    }
+
+    private static GcUpdateHandler.GcBatchResult vacuumBatchResult(
+            GcUpdateHandler gcUpdateHandler,
+            HybridTimestamp lowWatermark,
+            int count
+    ) {
+        var result = new GcUpdateHandler.GcBatchResult(count);
+
+        gcUpdateHandler.vacuumBatch(lowWatermark, count, result);
+
+        return result;
     }
 
     private TestPartitionDataStorage createPartitionDataStorage() {

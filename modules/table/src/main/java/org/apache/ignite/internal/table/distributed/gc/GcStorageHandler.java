@@ -48,7 +48,33 @@ class GcStorageHandler {
      */
     final AtomicReference<CompletableFuture<Void>> awaitSafeTimeFuture = new AtomicReference<>();
 
+    /** Whether the current sequence of immediately rescheduled batches has observed GC queue entries. */
+    private boolean garbageObserved;
+
     GcStorageHandler(GcUpdateHandler gcUpdateHandler) {
         this.gcUpdateHandler = gcUpdateHandler;
+    }
+
+    /**
+     * Records one batch result and reports whether it visibly completed a previously observed backlog.
+     *
+     * <p>A batch that removes exactly the configured batch size conservatively returns {@code garbageLeft=true}. The immediately
+     * rescheduled empty batch is therefore the only proof that the queue has drained. Keeping this state on the per-partition handler
+     * lets diagnostics emit that terminal result without changing the scheduling contract.</p>
+     */
+    synchronized boolean recordBatchAndCheckConvergence(GcUpdateHandler.GcBatchResult result) {
+        if (result.peekedEntries > 0) {
+            garbageObserved = true;
+        }
+
+        if (result.garbageLeft()) {
+            return false;
+        }
+
+        boolean backlogConverged = garbageObserved;
+
+        garbageObserved = false;
+
+        return backlogConverged;
     }
 }

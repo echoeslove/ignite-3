@@ -11,6 +11,7 @@ CLUSTER_NAME="job-classloader-cache-validation"
 ACTION="${1:-start}"
 USE_LAUNCHCTL="${IGNITE_USE_LAUNCHCTL:-true}"
 PORT_OFFSET="${IGNITE_PORT_OFFSET:-0}"
+NODE_HEAP="${IGNITE_NODE_HEAP:-1g}"
 
 if [[ ! -f "${ARTIFACT_MANIFEST}" ]]; then
     echo "ERROR: Build manifest not found. Run 01-build-ignite.sh first." >&2
@@ -212,8 +213,8 @@ write_node_configuration() {
 
     sed -i.bak \
         -e "s/^NODE_NAME=.*/NODE_NAME=node${index}/" \
-        -e 's/^JVM_MAX_MEM=.*/JVM_MAX_MEM="1g"/' \
-        -e 's/^JVM_MIN_MEM=.*/JVM_MIN_MEM="1g"/' \
+        -e "s/^JVM_MAX_MEM=.*/JVM_MAX_MEM=\"${NODE_HEAP}\"/" \
+        -e "s/^JVM_MIN_MEM=.*/JVM_MIN_MEM=\"${NODE_HEAP}\"/" \
         -e 's/^JVM_G1HeapRegionSize=.*/JVM_G1HeapRegionSize="4M"/' \
         -e 's|^IGNITE3_EXTRA_JVM_ARGS=.*|IGNITE3_EXTRA_JVM_ARGS="-XX:NativeMemoryTracking=summary -XX:+UnlockDiagnosticVMOptions -XX:+ClassUnloadingWithConcurrentMark -Xlog:class+unload=info"|' \
         "${vars_file}"

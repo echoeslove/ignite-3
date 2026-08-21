@@ -27,9 +27,12 @@ import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -37,6 +40,7 @@ import org.apache.ignite.internal.schema.BinaryRow;
 import org.apache.ignite.internal.schema.BinaryTuple;
 import org.apache.ignite.internal.schema.ColumnsExtractor;
 import org.apache.ignite.internal.storage.BinaryRowAndRowId;
+import org.apache.ignite.internal.storage.ReadResult;
 import org.apache.ignite.internal.storage.RowId;
 import org.apache.ignite.internal.storage.StorageDestroyedException;
 import org.apache.ignite.internal.storage.StorageException;
@@ -44,9 +48,14 @@ import org.apache.ignite.internal.storage.index.IndexStorage;
 import org.apache.ignite.internal.table.distributed.TableIndexStoragesSupplier;
 import org.apache.ignite.internal.table.distributed.TableSchemaAwareIndexStorage;
 import org.apache.ignite.internal.testframework.BaseIgniteAbstractTest;
+import org.apache.ignite.internal.util.Cursor;
 import org.junit.jupiter.api.Test;
 
-/** For {@link IndexUpdateHandler} testing. */
+/**
+ * Hotfix2 downstream regression coverage for {@link IndexUpdateHandler}.
+ *
+ * <p>Not part of upstream IGNITE-26995, IGNITE-26996, or IGNITE-26998.</p>
+ */
 public class IndexUpdateHandlerTest extends BaseIgniteAbstractTest {
     private static final int PARTITION_ID = 0;
 
@@ -239,6 +248,167 @@ public class IndexUpdateHandlerTest extends BaseIgniteAbstractTest {
     }
 
     @Test
+    void testTryRemoveFromIndexesDoesNotScanWhenThereAreNoIndexes() {
+        var indexUpdateHandler = new IndexUpdateHandler(indexStoragesSupplier(Map.of(INDEX_ID, createIndexStorage())));
+        Cursor<ReadResult> previousValues = mock(Cursor.class);
+
+        indexUpdateHandler.tryRemoveFromIndexes(
+                mock(BinaryRow.class),
+                new RowId(PARTITION_ID),
+                previousValues,
+                List.of(INDEX_ID + 1)
+        );
+
+        verify(previousValues, never()).hasNext();
+    }
+
+    @Test
+    void testTryRemoveFromIndexesStopsAfterFirstMatchingVersion() {
+        BinaryRow rowToRemove = mock(BinaryRow.class);
+        BinaryRow matchingRow = mock(BinaryRow.class);
+        TableSchemaAwareIndexStorage indexStorage = createIndexStorage();
+
+        stubIndexValue(indexStorage, rowToRemove, 1);
+        stubIndexValue(indexStorage, matchingRow, 1);
+
+        ReadResult matchingVersion = mock(ReadResult.class);
+        when(matchingVersion.binaryRow()).thenReturn(matchingRow);
+
+        Cursor<ReadResult> previousValues = mock(Cursor.class);
+        when(previousValues.hasNext()).thenReturn(true);
+        when(previousValues.next()).thenReturn(matchingVersion);
+
+        RowId rowId = new RowId(PARTITION_ID);
+        var indexUpdateHandler = new IndexUpdateHandler(indexStoragesSupplier(Map.of(INDEX_ID, indexStorage)));
+
+        indexUpdateHandler.tryRemoveFromIndexes(rowToRemove, rowId, previousValues, null);
+
+        verify(previousValues).hasNext();
+        verify(previousValues).next();
+        verify(indexStorage, never()).remove(any(), any());
+    }
+
+    @Test
+    void testTryRemoveFromIndexesStopsWhenAllIndexesMatchInDifferentVersions() {
+        BinaryRow rowToRemove = mock(BinaryRow.class);
+        BinaryRow firstPreviousRow = mock(BinaryRow.class);
+        BinaryRow secondPreviousRow = mock(BinaryRow.class);
+
+        TableSchemaAwareIndexStorage firstIndex = createIndexStorage();
+        stubIndexValue(firstIndex, rowToRemove, 1);
+        stubIndexValue(firstIndex, firstPreviousRow, 1);
+
+        TableSchemaAwareIndexStorage secondIndex = createIndexStorage();
+        stubIndexValue(secondIndex, rowToRemove, 2);
+        stubIndexValue(secondIndex, firstPreviousRow, 3);
+        stubIndexValue(secondIndex, secondPreviousRow, 2);
+
+        ReadResult firstPreviousVersion = mock(ReadResult.class);
+        when(firstPreviousVersion.binaryRow()).thenReturn(firstPreviousRow);
+        ReadResult secondPreviousVersion = mock(ReadResult.class);
+        when(secondPreviousVersion.binaryRow()).thenReturn(secondPreviousRow);
+
+        Cursor<ReadResult> previousValues = mock(Cursor.class);
+        when(previousValues.hasNext()).thenReturn(true, true, true);
+        when(previousValues.next()).thenReturn(firstPreviousVersion, secondPreviousVersion);
+
+        var indexUpdateHandler = new IndexUpdateHandler(indexStoragesSupplier(Map.of(
+                INDEX_ID, firstIndex,
+                INDEX_ID + 1, secondIndex
+        )));
+
+        indexUpdateHandler.tryRemoveFromIndexes(rowToRemove, new RowId(PARTITION_ID), previousValues, null);
+
+        verify(previousValues, times(2)).hasNext();
+        verify(previousValues, times(2)).next();
+        verify(firstIndex, never()).remove(any(), any());
+        verify(secondIndex, never()).remove(any(), any());
+    }
+
+    @Test
+    void testTryRemoveFromIndexesScansAllVersionsAndRemovesUnmatchedValue() {
+        BinaryRow rowToRemove = mock(BinaryRow.class);
+        BinaryRow firstPreviousRow = mock(BinaryRow.class);
+        BinaryRow secondPreviousRow = mock(BinaryRow.class);
+        TableSchemaAwareIndexStorage indexStorage = createIndexStorage();
+
+        stubIndexValue(indexStorage, rowToRemove, 1);
+        stubIndexValue(indexStorage, firstPreviousRow, 2);
+        stubIndexValue(indexStorage, secondPreviousRow, 3);
+
+        ReadResult firstPreviousVersion = mock(ReadResult.class);
+        when(firstPreviousVersion.binaryRow()).thenReturn(firstPreviousRow);
+        ReadResult secondPreviousVersion = mock(ReadResult.class);
+        when(secondPreviousVersion.binaryRow()).thenReturn(secondPreviousRow);
+
+        Cursor<ReadResult> previousValues = mock(Cursor.class);
+        when(previousValues.hasNext()).thenReturn(true, true, false);
+        when(previousValues.next()).thenReturn(firstPreviousVersion, secondPreviousVersion);
+
+        RowId rowId = new RowId(PARTITION_ID);
+        var indexUpdateHandler = new IndexUpdateHandler(indexStoragesSupplier(Map.of(INDEX_ID, indexStorage)));
+
+        indexUpdateHandler.tryRemoveFromIndexes(rowToRemove, rowId, previousValues, null);
+
+        verify(previousValues, times(3)).hasNext();
+        verify(previousValues, times(2)).next();
+        verify(indexStorage).remove(rowToRemove, rowId);
+    }
+
+    @Test
+    void testTryRemoveFromIndexesIgnoresTombstoneWhenLookingForMatch() {
+        BinaryRow rowToRemove = mock(BinaryRow.class);
+        BinaryRow matchingRow = mock(BinaryRow.class);
+        TableSchemaAwareIndexStorage indexStorage = createIndexStorage();
+
+        stubIndexValue(indexStorage, rowToRemove, 1);
+        stubIndexValue(indexStorage, matchingRow, 1);
+
+        ReadResult tombstone = mock(ReadResult.class);
+        ReadResult matchingVersion = mock(ReadResult.class);
+        when(matchingVersion.binaryRow()).thenReturn(matchingRow);
+
+        Cursor<ReadResult> previousValues = mock(Cursor.class);
+        when(previousValues.hasNext()).thenReturn(true, true);
+        when(previousValues.next()).thenReturn(tombstone, matchingVersion);
+
+        var indexUpdateHandler = new IndexUpdateHandler(indexStoragesSupplier(Map.of(INDEX_ID, indexStorage)));
+
+        indexUpdateHandler.tryRemoveFromIndexes(rowToRemove, new RowId(PARTITION_ID), previousValues, null);
+
+        verify(previousValues, times(2)).next();
+        verify(indexStorage, never()).remove(any(), any());
+        verify(indexStorage.indexRowResolver(), never()).extractColumns((BinaryRow) null);
+    }
+
+    @Test
+    void testTryRemoveFromIndexesUsesResolverForDifferentSchemaVersions() {
+        BinaryRow rowToRemove = mock(BinaryRow.class);
+        when(rowToRemove.schemaVersion()).thenReturn(1);
+        BinaryRow matchingRow = mock(BinaryRow.class);
+        when(matchingRow.schemaVersion()).thenReturn(2);
+
+        TableSchemaAwareIndexStorage indexStorage = createIndexStorage();
+        stubIndexValue(indexStorage, rowToRemove, 1);
+        stubIndexValue(indexStorage, matchingRow, 1);
+
+        ReadResult matchingVersion = mock(ReadResult.class);
+        when(matchingVersion.binaryRow()).thenReturn(matchingRow);
+
+        var indexUpdateHandler = new IndexUpdateHandler(indexStoragesSupplier(Map.of(INDEX_ID, indexStorage)));
+
+        indexUpdateHandler.tryRemoveFromIndexes(
+                rowToRemove,
+                new RowId(PARTITION_ID),
+                Cursor.fromIterable(List.of(matchingVersion)),
+                null
+        );
+
+        verify(indexStorage.indexRowResolver()).extractColumns(rowToRemove);
+        verify(indexStorage.indexRowResolver()).extractColumns(matchingRow);
+    }
+
+    @Test
     void testTryRemoveFromIndexesOnDestroyedIndex() {
         TableSchemaAwareIndexStorage indexStorage = createIndexStorage();
         ColumnsExtractor columnsExtractor = indexStorage.indexRowResolver();
@@ -287,6 +457,21 @@ public class IndexUpdateHandlerTest extends BaseIgniteAbstractTest {
         when(indexStorage.indexRowResolver()).thenReturn(columnsExtractor);
 
         return indexStorage;
+    }
+
+    private static BinaryTuple binaryTuple(int value) {
+        BinaryTuple tuple = mock(BinaryTuple.class);
+
+        when(tuple.byteBuffer()).thenReturn(ByteBuffer.wrap(new byte[]{(byte) value}));
+
+        return tuple;
+    }
+
+    private static void stubIndexValue(TableSchemaAwareIndexStorage indexStorage, BinaryRow row, int value) {
+        ColumnsExtractor columnsExtractor = indexStorage.indexRowResolver();
+        BinaryTuple tuple = binaryTuple(value);
+
+        when(columnsExtractor.extractColumns(row)).thenReturn(tuple);
     }
 
     private static TableIndexStoragesSupplier indexStoragesSupplier(Map<Integer, TableSchemaAwareIndexStorage> indexStorageById) {

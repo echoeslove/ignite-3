@@ -40,6 +40,7 @@ import org.apache.ignite.internal.failure.FailureProcessor;
 import org.apache.ignite.internal.hlc.HybridTimestamp;
 import org.apache.ignite.internal.lang.IgniteInternalException;
 import org.apache.ignite.internal.logger.IgniteLogger;
+import org.apache.ignite.internal.logger.IgniteThrottledLogger;
 import org.apache.ignite.internal.logger.Loggers;
 import org.apache.ignite.internal.lowwatermark.LowWatermark;
 import org.apache.ignite.internal.lowwatermark.event.ChangeLowWatermarkEventParameters;
@@ -58,6 +59,13 @@ import org.jetbrains.annotations.TestOnly;
  */
 public class MvGc implements ManuallyCloseable {
     private static final IgniteLogger LOG = Loggers.forClass(MvGc.class);
+
+    /**
+     * Hotfix2 downstream batch-summary logger, not part of upstream IGNITE-26995, IGNITE-26996, or IGNITE-26998.
+     *
+     * <p>It is separated from {@link #LOG} so throttling cannot change existing MVGC or thread-factory logging.</p>
+     */
+    private static final IgniteThrottledLogger BATCH_SUMMARY_LOG = Loggers.toThrottledLogger(LOG, Runnable::run);
 
     /** Node name. */
     private final String nodeName;
@@ -252,7 +260,10 @@ public class MvGc implements ManuallyCloseable {
                         });
 
                 currentAwaitSafeTimeFuture
-                        .thenApplyAsync(unused -> gcUpdateHandler.vacuumBatch(lowWatermark, gcConfig.value().batchSize()), executor)
+                        .thenApplyAsync(
+                                unused -> vacuumBatch(tablePartitionId, storageHandler, lowWatermark, gcConfig.value().batchSize()),
+                                executor
+                        )
                         .whenComplete((isGarbageLeft, throwable) -> {
                             if (throwable != null) {
                                 if (hasCause(throwable, TrackerClosedException.class, StorageRemovedException.class)) {
@@ -282,6 +293,79 @@ public class MvGc implements ManuallyCloseable {
                 currentGcFuture.completeExceptionally(t);
             }
         });
+    }
+
+    /**
+     * Runs one official MVGC batch and emits Hotfix2 downstream aggregate diagnostics around it.
+     *
+     * <p>The method preserves the scheduler contract by returning {@link GcUpdateHandler.GcBatchResult#garbageLeft()} unchanged.
+     * Timing and logging happen after the synchronous batch and do not alter storage locks, low-watermark handling, or rescheduling.</p>
+     *
+     * <p>Scan amplification uses successfully vacuumed entries as the denominator, falling back to one when nothing was removed.
+     * Backlog convergence spans an immediately rescheduled sequence: this is required because an exact full batch conservatively
+     * returns {@code garbageLeft=true}, and only the following empty batch proves that the queue drained. Slow-batch and
+     * scan-amplification classification remains in offline analysis.</p>
+     *
+     * @param tablePartitionId Partition used only to identify the summary and its throttle key.
+     * @param storageHandler Existing official storage handler and owner of per-partition convergence state.
+     * @param lowWatermark Low watermark passed unchanged to the batch.
+     * @param requestedEntries Configured maximum batch size.
+     * @return Original MVGC decision indicating whether another batch may be required.
+     */
+    private boolean vacuumBatch(
+            TablePartitionId tablePartitionId,
+            GcStorageHandler storageHandler,
+            HybridTimestamp lowWatermark,
+            int requestedEntries
+    ) {
+        long startNanos = System.nanoTime();
+
+        var result = new GcUpdateHandler.GcBatchResult(requestedEntries);
+
+        storageHandler.gcUpdateHandler.vacuumBatch(
+                lowWatermark,
+                requestedEntries,
+                result
+        );
+
+        long durationMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+        double scanAmplification = (double) result.versionsScanned / Math.max(result.vacuumedEntries, 1);
+        boolean backlogConverged = storageHandler.recordBatchAndCheckConvergence(result);
+        boolean logAtInfo = result.garbageLeft() || backlogConverged;
+
+        if (logAtInfo || LOG.isDebugEnabled()) {
+            // Example: MVGC batch summary [tableId=1, partitionId=0,
+            // lowWatermark=HybridTimestamp [physical=1970-01-01 00:00:00:002 +0000, logical=2, composite=131074],
+            // requestedEntries=5, peekedEntries=5, vacuumedEntries=5, versionsScanned=5, scanAmplification=1.0,
+            // durationMs=12, garbageLeft=true, yieldedToCheckpoint=false, removedByAnotherThread=0].
+            String message = "MVGC batch summary [tableId=" + tablePartitionId.tableId()
+                    + ", partitionId=" + tablePartitionId.partitionId()
+                    + ", lowWatermark=" + lowWatermark
+                    + ", requestedEntries=" + result.requestedEntries
+                    + ", peekedEntries=" + result.peekedEntries
+                    + ", vacuumedEntries=" + result.vacuumedEntries
+                    + ", versionsScanned=" + result.versionsScanned
+                    + ", scanAmplification=" + scanAmplification
+                    + ", durationMs=" + durationMillis
+                    + ", garbageLeft=" + result.garbageLeft()
+                    + ", yieldedToCheckpoint=" + result.yieldedToCheckpoint
+                    + ", removedByAnotherThread=" + result.removedByAnotherThread
+                    + ']';
+
+            // Repeated backlog summaries are limited per node and partition.
+            String throttleKey = nodeName + ':' + tablePartitionId;
+
+            if (result.garbageLeft()) {
+                BATCH_SUMMARY_LOG.info(throttleKey, message);
+            } else if (backlogConverged) {
+                // Use a separate key so an explicit garbageLeft=false is not suppressed by the preceding backlog=true summary.
+                BATCH_SUMMARY_LOG.info(throttleKey + ":converged", message);
+            } else {
+                LOG.debug(message);
+            }
+        }
+
+        return result.garbageLeft();
     }
 
     private <T> T inBusyLock(Supplier<T> supplier) {

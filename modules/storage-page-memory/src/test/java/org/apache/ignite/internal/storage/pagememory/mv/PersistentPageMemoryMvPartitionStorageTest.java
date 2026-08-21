@@ -24,6 +24,7 @@ import static org.apache.ignite.internal.schema.BinaryRowMatcher.isRow;
 import static org.apache.ignite.internal.testframework.matchers.CompletableFutureMatcher.willCompleteSuccessfully;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.is;
@@ -47,6 +48,7 @@ import org.apache.ignite.internal.storage.engine.MvTableStorage;
 import org.apache.ignite.internal.storage.engine.StorageTableDescriptor;
 import org.apache.ignite.internal.storage.index.StorageIndexDescriptorSupplier;
 import org.apache.ignite.internal.storage.pagememory.PersistentPageMemoryStorageEngine;
+import org.apache.ignite.internal.storage.pagememory.PersistentPageMemoryTableStorage;
 import org.apache.ignite.internal.testframework.ExecutorServiceExtension;
 import org.apache.ignite.internal.testframework.InjectExecutorService;
 import org.apache.ignite.internal.testframework.WorkDirectory;
@@ -125,6 +127,26 @@ class PersistentPageMemoryMvPartitionStorageTest extends AbstractPageMemoryMvPar
         restartStorage();
 
         assertThat(read(rowId, HybridTimestamp.MAX_VALUE), isRow(binaryRow));
+    }
+
+    /** Hotfix2 downstream regression test; not part of upstream IGNITE-26995, IGNITE-26996, or IGNITE-26998. */
+    @Test
+    void testGcPreloadingDoesNotDirtyPages() {
+        RowId rowId = new RowId(PARTITION_ID);
+
+        addWriteCommitted(rowId, binaryRow, clock.now());
+        addWriteCommitted(rowId, binaryRow, clock.now());
+
+        assertThat(
+                engine.checkpointManager().forceCheckpoint("before_gc_preloading").futureFor(FINISHED),
+                willCompleteSuccessfully()
+        );
+
+        var pageMemory = ((PersistentPageMemoryTableStorage) table).dataRegion().pageMemory();
+
+        assertThat(pageMemory.dirtyPages(), empty());
+        assertFalse(storage.peek(HybridTimestamp.MAX_VALUE, 1).isEmpty());
+        assertThat(pageMemory.dirtyPages(), empty());
     }
 
     private void restartStorage() throws Exception {

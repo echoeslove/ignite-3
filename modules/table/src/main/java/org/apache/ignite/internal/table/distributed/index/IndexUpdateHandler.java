@@ -96,6 +96,11 @@ public class IndexUpdateHandler {
      * Removes the row only if no previous value's index matches index of the row to remove, because if it matches, then the index
      * might still be in use.
      *
+     * <p>Hotfix2 downstream optimization, not part of upstream IGNITE-26995, IGNITE-26996, or IGNITE-26998: each index starts as a
+     * removal candidate. Once an older row has the same indexed value, that index is permanently excluded from removal. Therefore,
+     * when every candidate has been excluded, later versions cannot change the result and the cursor can be left unconsumed safely.
+     * This optimization changes only the amount of version-chain scanning; it does not change which index entries are removed.</p>
+     *
      * <p>Must be called inside a {@link MvPartitionStorage#runConsistently(WriteClosure)} closure.</p>
      *
      * @param rowToRemove Row to remove from indexes.
@@ -111,7 +116,19 @@ public class IndexUpdateHandler {
     ) {
         TableSchemaAwareIndexStorage[] indexes = indexesSnapshot(indexIds);
 
+        // This branch is reached when indexesSnapshot cannot resolve any active index storage:
+        // 1. indexIds is null (the MVGC call path) and the partition has no registered index storage;
+        // 2. indexIds is an empty list; or
+        // 3. indexIds is non-empty, but every requested index is absent because its destruction has already started.
+        // In all three cases there is no index entry to remove, so consuming the previous-version cursor cannot change the result.
+        if (indexes.length == 0) {
+            return;
+        }
+
         ByteBuffer[] indexValues = new ByteBuffer[indexes.length];
+
+        // Invariant: this is the number of non-null indexes that are still candidates for physical removal.
+        int remainingIndexes = indexes.length;
 
         // Precalculate value for every index.
         for (int i = 0; i < indexes.length; i++) {
@@ -139,7 +156,13 @@ public class IndexUpdateHandler {
                     BinaryTuple previousRowIndex = index.indexRowResolver().extractColumns(previousRow);
 
                     if (indexValues[i].equals(previousRowIndex.byteBuffer())) {
+                        // A matching older value means this index entry is still reachable and must never be removed for this row.
                         indexes[i] = null;
+
+                        // All indexes are now known to be retained; no later version can make an index removable again.
+                        if (--remainingIndexes == 0) {
+                            return;
+                        }
                     }
                 }
             }
