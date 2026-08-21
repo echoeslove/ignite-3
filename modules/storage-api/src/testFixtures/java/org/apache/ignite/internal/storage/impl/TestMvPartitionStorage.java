@@ -20,8 +20,10 @@ package org.apache.ignite.internal.storage.impl;
 import static java.util.Comparator.comparing;
 import static org.apache.ignite.internal.util.CompletableFutures.nullCompletedFuture;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.List;
 import java.util.NavigableSet;
 import java.util.NoSuchElementException;
 import java.util.UUID;
@@ -31,6 +33,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.function.BooleanSupplier;
 import org.apache.ignite.internal.hlc.HybridTimestamp;
 import org.apache.ignite.internal.schema.BinaryRow;
 import org.apache.ignite.internal.storage.AbortResult;
@@ -38,6 +41,7 @@ import org.apache.ignite.internal.storage.AddWriteCommittedResult;
 import org.apache.ignite.internal.storage.AddWriteResult;
 import org.apache.ignite.internal.storage.CommitResult;
 import org.apache.ignite.internal.storage.MvPartitionStorage;
+import org.apache.ignite.internal.storage.MvPartitionStorage.Locker;
 import org.apache.ignite.internal.storage.PartitionTimestampCursor;
 import org.apache.ignite.internal.storage.ReadResult;
 import org.apache.ignite.internal.storage.RowId;
@@ -93,17 +97,39 @@ public class TestMvPartitionStorage implements MvPartitionStorage {
 
     private final LockByRowId lockByRowId;
 
+    private final BooleanSupplier shouldReleaseSupplier;
+
     /** Amount of cursors that opened and still do not close. */
     private final AtomicInteger pendingCursors = new AtomicInteger();
 
     public TestMvPartitionStorage(int partitionId) {
-        this.partitionId = partitionId;
-        this.lockByRowId = new LockByRowId();
+        this(partitionId, new LockByRowId());
     }
 
     public TestMvPartitionStorage(int partitionId, LockByRowId lockByRowId) {
+        this(partitionId, lockByRowId, () -> false);
+    }
+
+    /**
+     * This constructor allows for creating a test partition storage with custom lock release behavior,
+     * which is useful for testing scenarios where lock contention needs to be simulated (e.g., during
+     * rebalancing or when other operations need to acquire locks held by long-running operations like GC).
+     *
+     * @param partitionId Partition ID.
+     * @param lockByRowId Shared lock manager for row-level locking.
+     * @param shouldReleaseSupplier Supplier that determines when locks should be released. When this supplier
+     *        returns {@code true}, operations holding locks (like GC vacuum) should exit early to allow
+     *        other operations to proceed. See
+     *        {@link Locker#shouldRelease()} for more details.
+     */
+    public TestMvPartitionStorage(
+            int partitionId,
+            LockByRowId lockByRowId,
+            BooleanSupplier shouldReleaseSupplier
+    ) {
         this.partitionId = partitionId;
         this.lockByRowId = lockByRowId;
+        this.shouldReleaseSupplier = shouldReleaseSupplier;
     }
 
     private static class VersionChain implements GcEntry {
@@ -174,7 +200,7 @@ public class TestMvPartitionStorage implements MvPartitionStorage {
         if (locker != null) {
             return closure.execute(locker);
         } else {
-            locker = new LocalLocker(lockByRowId);
+            locker = new TestStorageLocker();
 
             THREAD_LOCAL_LOCKER.set(locker);
 
@@ -629,20 +655,26 @@ public class TestMvPartitionStorage implements MvPartitionStorage {
     }
 
     @Override
-    public synchronized @Nullable GcEntry peek(HybridTimestamp lowWatermark) {
-        assert THREAD_LOCAL_LOCKER.get() != null;
+    public synchronized List<GcEntry> peek(HybridTimestamp lowWatermark, int count) {
+        if (count <= 0) {
+            return List.of();
+        }
 
-        try {
-            VersionChain versionChain = gcQueue.first();
+        var res = new ArrayList<GcEntry>(count);
 
-            if (versionChain.ts.compareTo(lowWatermark) > 0) {
-                return null;
+        Iterator<VersionChain> it = gcQueue.iterator();
+
+        for (int i = 0; i < count && it.hasNext(); i++) {
+            VersionChain next = it.next();
+
+            if (next.ts.compareTo(lowWatermark) > 0) {
+                break;
             }
 
-            return versionChain;
-        } catch (NoSuchElementException e) {
-            return null;
+            res.add(next);
         }
+
+        return res;
     }
 
     @Override
@@ -887,5 +919,16 @@ public class TestMvPartitionStorage implements MvPartitionStorage {
         VersionChain next = chain.next;
 
         return next == null ? null : next.ts;
+    }
+
+    private class TestStorageLocker extends LocalLocker {
+        private TestStorageLocker() {
+            super(lockByRowId);
+        }
+
+        @Override
+        public boolean shouldRelease() {
+            return shouldReleaseSupplier.getAsBoolean();
+        }
     }
 }

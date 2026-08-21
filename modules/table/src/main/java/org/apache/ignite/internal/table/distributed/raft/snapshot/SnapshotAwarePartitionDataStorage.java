@@ -17,6 +17,7 @@
 
 package org.apache.ignite.internal.table.distributed.raft.snapshot;
 
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import org.apache.ignite.internal.hlc.HybridTimestamp;
@@ -234,8 +235,8 @@ public class SnapshotAwarePartitionDataStorage implements PartitionDataStorage {
     }
 
     @Override
-    public @Nullable GcEntry peek(HybridTimestamp lowWatermark) {
-        return partitionStorage.peek(lowWatermark);
+    public List<GcEntry> peek(HybridTimestamp lowWatermark, int count) {
+        return partitionStorage.peek(lowWatermark, count);
     }
 
     @Override
