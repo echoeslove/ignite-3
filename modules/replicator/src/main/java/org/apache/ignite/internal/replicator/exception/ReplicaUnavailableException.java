@@ -38,6 +38,18 @@ public class ReplicaUnavailableException extends ReplicationException {
     }
 
     /**
+     * Creates an exception for a replica that stopped while processing a request.
+     *
+     * @param groupId Replication group id.
+     * @param node Node.
+     * @param cause Cause of the unavailability.
+     */
+    public ReplicaUnavailableException(ReplicationGroupId groupId, InternalClusterNode node, Throwable cause) {
+        super(REPLICA_UNAVAILABLE_ERR,
+                "Replica is not ready [replicationGroupId=" + groupId + ", nodeName=" + node.name() + ']', cause);
+    }
+
+    /**
      * The constructor is used for creating an exception instance that is thrown from a remote server.
      *
      * @param traceId Trace id.

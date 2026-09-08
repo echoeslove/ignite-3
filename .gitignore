@@ -26,3 +26,8 @@ out/
 
 # OpenAPI spec file
 modules/rest-api/openapi/openapi.*
+
+# Local incident/reproduction evidence that may contain internal environment details.
+/.codegraph/
+/CODE_REVIEW_REPORT.md
+/artifacts/ignite-3.1-domain-model/

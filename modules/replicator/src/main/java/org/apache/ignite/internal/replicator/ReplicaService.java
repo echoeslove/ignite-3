@@ -135,6 +135,14 @@ public class ReplicaService {
      * @see ReplicationTimeoutException If the response could not be received due to a timeout.
      */
     private CompletableFuture<ReplicaResponse> sendToReplicaRaw(String targetNodeConsistentId, ReplicaRequest req) {
+        return sendToReplicaRaw(targetNodeConsistentId, req, true);
+    }
+
+    private CompletableFuture<ReplicaResponse> sendToReplicaRaw(
+            String targetNodeConsistentId,
+            ReplicaRequest req,
+            boolean awaitReplicaReady
+    ) {
         CompletableFuture<ReplicaResponse> res = new CompletableFuture<>();
 
         messagingService.invoke(
@@ -167,7 +175,7 @@ public class ReplicaService {
                 if (response instanceof ErrorReplicaResponse) {
                     var errResp = (ErrorReplicaResponse) response;
 
-                    if (errResp.throwable() instanceof ReplicaUnavailableException) {
+                    if (errResp.throwable() instanceof ReplicaUnavailableException && awaitReplicaReady) {
                         CompletableFuture<NetworkMessage> requestFuture = new CompletableFuture<>();
 
                         CompletableFuture<NetworkMessage> awaitReplicaFut = pendingInvokes.computeIfAbsent(
@@ -331,6 +339,20 @@ public class ReplicaService {
      */
     public CompletableFuture<ReplicaResponse> invokeRaw(String targetNodeConsistentId, ReplicaRequest request) {
         return sendToReplicaRaw(targetNodeConsistentId, request);
+    }
+
+    /**
+     * Sends a request to the given replica without waiting for a replica that is not ready.
+     *
+     * <p>This is intended for callers that can safely route a failed request to another replica.
+     * A {@link ReplicaUnavailableException} is returned immediately when the target replica is not ready.
+     *
+     * @param node Replica node.
+     * @param request Request.
+     * @return Response future with either evaluation result or completed exceptionally.
+     */
+    public <R> CompletableFuture<R> invokeWithoutReplicaWait(InternalClusterNode node, ReplicaRequest request) {
+        return (CompletableFuture<R>) sendToReplicaRaw(node.name(), request, false).thenApply(ReplicaResponse::result);
     }
 
     public MessagingService messagingService() {

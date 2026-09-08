@@ -1830,7 +1830,9 @@ public class TableManager implements IgniteTablesInternal, IgniteComponent {
                 () -> txCfg.value().readWriteTimeoutMillis(),
                 () -> txCfg.value().readOnlyTimeoutMillis(),
                 nodeProperties.colocationEnabled(),
-                createAndRegisterMetricsSource(tableName)
+                createAndRegisterMetricsSource(tableName),
+                topologyService::localMember,
+                replicaMgr::isReplicaReady
         );
 
         return new TableImpl(

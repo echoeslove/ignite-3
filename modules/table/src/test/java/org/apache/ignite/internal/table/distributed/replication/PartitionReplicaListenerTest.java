@@ -179,6 +179,7 @@ import org.apache.ignite.internal.replicator.TablePartitionId;
 import org.apache.ignite.internal.replicator.ZonePartitionId;
 import org.apache.ignite.internal.replicator.configuration.ReplicationConfiguration;
 import org.apache.ignite.internal.replicator.exception.PrimaryReplicaMissException;
+import org.apache.ignite.internal.replicator.exception.ReplicaUnavailableException;
 import org.apache.ignite.internal.replicator.message.PrimaryReplicaRequest;
 import org.apache.ignite.internal.replicator.message.ReadOnlyDirectReplicaRequest;
 import org.apache.ignite.internal.replicator.message.ReplicaMessagesFactory;
@@ -261,6 +262,7 @@ import org.apache.ignite.internal.type.NativeTypes;
 import org.apache.ignite.internal.util.Cursor;
 import org.apache.ignite.internal.util.Lazy;
 import org.apache.ignite.internal.util.PendingComparableValuesTracker;
+import org.apache.ignite.internal.util.SafeTimeValuesTracker;
 import org.apache.ignite.lang.ErrorGroups.Transactions;
 import org.apache.ignite.network.NetworkAddress;
 import org.apache.ignite.sql.ColumnType;
@@ -873,6 +875,45 @@ public class PartitionReplicaListenerTest extends IgniteAbstractTest {
         BinaryRow binaryRow = (BinaryRow) fut.get(1, TimeUnit.SECONDS).result();
 
         assertNull(binaryRow);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void readOnlyGetReportsReplicaUnavailableWhenSafeTimeTrackerCloses(boolean multiRow) {
+        placementDriver.setPrimaryReplicaSupplier(() -> new TestReplicaMetaImpl("node3", nodeId(3)));
+
+        SafeTimeValuesTracker tracker = new SafeTimeValuesTracker(HybridTimestamp.MIN_VALUE);
+        try {
+            when(safeTimeClock.waitFor(any())).thenAnswer(invocation -> tracker.waitFor(invocation.getArgument(0)));
+
+            BinaryRow key = nextBinaryKey();
+            CompletableFuture<ReplicaResult> result = multiRow
+                    ? doReadOnlyMultiGet(List.of(key), clock.now())
+                    : doReadOnlySingleGet(key);
+
+            assertFalse(result.isDone());
+            tracker.close();
+
+            assertThat(result, willThrowFast(ReplicaUnavailableException.class));
+            verify(pkIndexStorage, never()).get(any());
+        } finally {
+            tracker.close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void readOnlyGetPreservesOtherSafeTimeFailures(boolean multiRow) {
+        placementDriver.setPrimaryReplicaSupplier(() -> new TestReplicaMetaImpl("node3", nodeId(3)));
+        when(safeTimeClock.waitFor(any())).thenReturn(failedFuture(new IllegalStateException("not a stopped replica")));
+
+        BinaryRow key = nextBinaryKey();
+        CompletableFuture<ReplicaResult> result = multiRow
+                ? doReadOnlyMultiGet(List.of(key), clock.now())
+                : doReadOnlySingleGet(key);
+
+        assertThat(result, willThrowFast(IllegalStateException.class, "not a stopped replica"));
+        verify(pkIndexStorage, never()).get(any());
     }
 
     private CompletableFuture<ReplicaResult> doReadOnlySingleGet(BinaryRow pk) {

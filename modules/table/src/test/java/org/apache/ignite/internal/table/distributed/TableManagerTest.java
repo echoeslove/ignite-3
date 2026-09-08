@@ -53,6 +53,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
@@ -300,6 +301,10 @@ public class TableManagerTest extends IgniteAbstractTest {
         assertThat("Catalog initialization", catalogManager.catalogInitializationFuture(), willCompleteSuccessfully());
 
         when(clusterService.messagingService()).thenReturn(mock(MessagingService.class));
+
+        TopologyService topologyService = mock(TopologyService.class);
+        when(clusterService.topologyService()).thenReturn(topologyService);
+        lenient().when(topologyService.localMember()).thenReturn(node);
 
         tblManagerFut = new CompletableFuture<>();
 

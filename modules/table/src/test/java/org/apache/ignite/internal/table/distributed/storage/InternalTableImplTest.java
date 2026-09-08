@@ -19,6 +19,8 @@ package org.apache.ignite.internal.table.distributed.storage;
 
 import static java.util.UUID.randomUUID;
 import static java.util.concurrent.CompletableFuture.completedFuture;
+import static java.util.concurrent.CompletableFuture.failedFuture;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.apache.ignite.internal.lang.IgniteSystemProperties.COLOCATION_FEATURE_FLAG;
 import static org.apache.ignite.internal.lang.IgniteSystemProperties.colocationEnabled;
 import static org.apache.ignite.internal.table.distributed.storage.InternalTableImpl.collectMultiRowsResponsesWithRestoreOrder;
@@ -28,6 +30,8 @@ import static org.apache.ignite.internal.testframework.matchers.CompletableFutur
 import static org.apache.ignite.internal.util.CompletableFutures.emptyListCompletedFuture;
 import static org.apache.ignite.internal.util.CompletableFutures.nullCompletedFuture;
 import static org.apache.ignite.internal.util.CompletableFutures.trueCompletedFuture;
+import static org.apache.ignite.lang.ErrorGroups.Replicator.REPLICA_TIMEOUT_ERR;
+import static org.apache.ignite.lang.ErrorGroups.Transactions.TX_ALREADY_FINISHED_ERR;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.aMapWithSize;
 import static org.hamcrest.Matchers.contains;
@@ -36,16 +40,22 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
 import java.nio.ByteBuffer;
@@ -53,10 +63,15 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Flow.Publisher;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
 import org.apache.ignite.internal.hlc.ClockService;
 import org.apache.ignite.internal.hlc.HybridClock;
@@ -69,16 +84,23 @@ import org.apache.ignite.internal.network.InternalClusterNode;
 import org.apache.ignite.internal.network.SingleClusterNodeResolver;
 import org.apache.ignite.internal.partition.replicator.network.replication.MultipleRowPkReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.MultipleRowReplicaRequest;
+import org.apache.ignite.internal.partition.replicator.network.replication.ReadOnlyReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.RequestType;
 import org.apache.ignite.internal.partition.replicator.network.replication.ScanRetrieveBatchReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.SingleRowPkReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.SingleRowReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.SwapRowReplicaRequest;
+import org.apache.ignite.internal.partitiondistribution.Assignment;
+import org.apache.ignite.internal.partitiondistribution.TokenizedAssignments;
+import org.apache.ignite.internal.partitiondistribution.TokenizedAssignmentsImpl;
 import org.apache.ignite.internal.placementdriver.PlacementDriver;
+import org.apache.ignite.internal.placementdriver.ReplicaMeta;
 import org.apache.ignite.internal.placementdriver.leases.Lease;
 import org.apache.ignite.internal.replicator.ReplicaService;
 import org.apache.ignite.internal.replicator.ReplicationGroupId;
 import org.apache.ignite.internal.replicator.ZonePartitionId;
+import org.apache.ignite.internal.replicator.exception.ReplicaUnavailableException;
+import org.apache.ignite.internal.replicator.message.ReadOnlyDirectReplicaRequest;
 import org.apache.ignite.internal.replicator.message.ReplicaRequest;
 import org.apache.ignite.internal.schema.BinaryRow;
 import org.apache.ignite.internal.schema.BinaryRowEx;
@@ -93,6 +115,7 @@ import org.apache.ignite.internal.testframework.SystemPropertiesExtension;
 import org.apache.ignite.internal.testframework.WithSystemProperty;
 import org.apache.ignite.internal.tx.InternalTransaction;
 import org.apache.ignite.internal.tx.PendingTxPartitionEnlistment;
+import org.apache.ignite.internal.tx.TransactionIds;
 import org.apache.ignite.internal.tx.TxManager;
 import org.apache.ignite.internal.tx.impl.ReadWriteTransactionImpl;
 import org.apache.ignite.internal.tx.impl.TransactionInflights;
@@ -102,11 +125,14 @@ import org.apache.ignite.internal.util.PendingComparableValuesTracker;
 import org.apache.ignite.network.NetworkAddress;
 import org.apache.ignite.table.QualifiedName;
 import org.apache.ignite.table.QualifiedNameHelper;
+import org.apache.ignite.tx.TransactionException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -228,6 +254,526 @@ public class InternalTableImplTest extends BaseIgniteAbstractTest {
 
         verify(safeTime0).close();
         verify(storageIndex0).close();
+    }
+
+    @Test
+    void readOnlyRecipientUsesLocalStablePeerByDefault() {
+        InternalTableImpl internalTable = new InternalTableImpl(
+                QualifiedNameHelper.fromNormalized(SqlCommon.DEFAULT_SCHEMA_NAME, "test"),
+                ZONE_ID,
+                TABLE_ID,
+                1,
+                new SingleClusterNodeResolver(clusterNode),
+                txManager,
+                mock(MvTableStorage.class),
+                mock(TxStateStorage.class),
+                replicaService,
+                clockService,
+                HybridTimestampTracker.atomicTracker(null),
+                placementDriver,
+                new TransactionInflights(placementDriver, clockService),
+                () -> mock(ScheduledExecutorService.class),
+                mock(StreamerReceiverRunner.class),
+                () -> 10_000L,
+                () -> 10_000L,
+                colocationEnabled(),
+                new TableMetricSource(QualifiedName.fromSimple("test")),
+                () -> clusterNode,
+                groupId -> true
+        );
+
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(completedFuture(
+                new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(clusterNode.name())), 1)
+        ));
+
+        assertThat(internalTable.evaluateReadOnlyRecipientNode(0, clock.now()), willBe(equalTo(clusterNode)));
+
+        verify(placementDriver, never()).awaitPrimaryReplica(any(), any(), anyLong(), any());
+    }
+
+    @Test
+    void readOnlyRecipientFallsBackToPrimaryWhenLocalReplicaIsNotReady() {
+        InternalTableImpl internalTable = new InternalTableImpl(
+                QualifiedNameHelper.fromNormalized(SqlCommon.DEFAULT_SCHEMA_NAME, "test"),
+                ZONE_ID,
+                TABLE_ID,
+                1,
+                new SingleClusterNodeResolver(clusterNode),
+                txManager,
+                mock(MvTableStorage.class),
+                mock(TxStateStorage.class),
+                replicaService,
+                clockService,
+                HybridTimestampTracker.atomicTracker(null),
+                placementDriver,
+                new TransactionInflights(placementDriver, clockService),
+                () -> mock(ScheduledExecutorService.class),
+                mock(StreamerReceiverRunner.class),
+                () -> 10_000L,
+                () -> 10_000L,
+                colocationEnabled(),
+                new TableMetricSource(QualifiedName.fromSimple("test")),
+                () -> clusterNode,
+                groupId -> false
+        );
+
+        assertThat(internalTable.evaluateReadOnlyRecipientNode(0, clock.now()), willBe(equalTo(clusterNode)));
+
+        verify(placementDriver).awaitPrimaryReplica(any(), any(), anyLong(), any());
+    }
+
+    @Test
+    void readOnlyGetAllFallsBackToPrimaryWhenLocalReplicaDisappears() {
+        InternalTableImpl internalTable = new InternalTableImpl(
+                QualifiedNameHelper.fromNormalized(SqlCommon.DEFAULT_SCHEMA_NAME, "test"),
+                ZONE_ID,
+                TABLE_ID,
+                1,
+                new SingleClusterNodeResolver(clusterNode),
+                txManager,
+                mock(MvTableStorage.class),
+                mock(TxStateStorage.class),
+                replicaService,
+                clockService,
+                HybridTimestampTracker.atomicTracker(null),
+                placementDriver,
+                new TransactionInflights(placementDriver, clockService),
+                () -> mock(ScheduledExecutorService.class),
+                mock(StreamerReceiverRunner.class),
+                () -> 10_000L,
+                () -> 10_000L,
+                colocationEnabled(),
+                new TableMetricSource(QualifiedName.fromSimple("test")),
+                () -> clusterNode,
+                groupId -> true
+        );
+
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(completedFuture(
+                new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(clusterNode.name())), 1)
+        ));
+        when(replicaService.invokeWithoutReplicaWait(eq(clusterNode), any())).thenReturn(failedFuture(
+                new ReplicaUnavailableException(new ZonePartitionId(ZONE_ID, 0), clusterNode)
+        ));
+        when(replicaService.invoke(eq(clusterNode), any())).thenReturn(completedFuture(Collections.singletonList(null)));
+
+        assertThat(
+                internalTable.getAll(List.of(createBinaryRow(0)), clock.now(), randomUUID(), randomUUID(), null),
+                willCompleteSuccessfully()
+        );
+
+        verify(replicaService).invokeWithoutReplicaWait(eq(clusterNode), any());
+        verify(replicaService).invoke(eq(clusterNode), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void localReadAttemptFallsBackWhenReplicaStopsDuringAssignmentsWait(boolean multiRow) {
+        InternalClusterNode local = new ClusterNodeImpl(randomUUID(), "backup", new NetworkAddress("host", 3001));
+        AtomicBoolean ready = new AtomicBoolean(true);
+        InternalTableImpl table = new InternalTableImpl(
+                QualifiedName.fromSimple("test"), ZONE_ID, TABLE_ID, 1,
+                new SingleClusterNodeResolver(clusterNode), txManager,
+                mock(MvTableStorage.class), mock(TxStateStorage.class), replicaService,
+                clockService, HybridTimestampTracker.atomicTracker(null), placementDriver,
+                new TransactionInflights(placementDriver, clockService),
+                () -> mock(ScheduledExecutorService.class), mock(StreamerReceiverRunner.class),
+                () -> 10_000L, () -> 10_000L, colocationEnabled(),
+                new TableMetricSource(QualifiedName.fromSimple("test")), () -> local, groupId -> ready.get()
+        );
+        CompletableFuture<TokenizedAssignments> assignments = new CompletableFuture<>();
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(assignments);
+        when(replicaService.invokeWithoutReplicaWait(eq(local), any())).thenReturn(failedFuture(
+                new ReplicaUnavailableException(new ZonePartitionId(ZONE_ID, 0), local)
+        ));
+        when(replicaService.invoke(eq(clusterNode), any())).thenReturn(completedFuture(
+                multiRow ? Collections.singletonList(null) : null
+        ));
+        InternalTransaction tx = explicitReadOnlyTransaction();
+
+        CompletableFuture<?> read = multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx);
+        ready.set(false);
+        assignments.complete(new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(local.name())), 1));
+
+        assertThat(read, willCompleteSuccessfully());
+        verify(replicaService).invokeWithoutReplicaWait(eq(local), any());
+        verify(replicaService).invoke(eq(clusterNode), any());
+        verify(replicaService, never()).invoke(eq(local), any());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,peer", "true,peer", "false,absent", "true,absent", "false,learner", "true,learner",
+            "false,empty", "true,empty", "false,error", "true,error", "false,notReady", "true,notReady",
+            "false,nullLocal", "true,nullLocal"})
+    void explicitReadOnlyRoutesByLocalEligibility(boolean multiRow, String scenario) {
+        InternalClusterNode local = new ClusterNodeImpl(randomUUID(), "backup", new NetworkAddress("host", 3001));
+        InternalTableImpl table = localReadTable(scenario.equals("nullLocal") ? null : local,
+                !scenario.equals("notReady"));
+        Set<Assignment> peers = scenario.equals("learner") ? Set.of(Assignment.forLearner(local.name()))
+                : scenario.equals("absent") ? Set.of(Assignment.forPeer(clusterNode.name()))
+                : Set.of(Assignment.forPeer(local.name()));
+        lenient().when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class)))
+                .thenReturn(scenario.equals("error") ? failedFuture(new IllegalStateException("assignments unavailable"))
+                        : completedFuture(scenario.equals("empty") ? null : new TokenizedAssignmentsImpl(peers, 1)));
+        Object response = multiRow ? Collections.singletonList(null) : null;
+        boolean localExpected = scenario.equals("peer");
+        if (localExpected) {
+            when(replicaService.invokeWithoutReplicaWait(eq(local), any())).thenReturn(completedFuture(response));
+        } else {
+            when(replicaService.invoke(eq(clusterNode), any())).thenReturn(completedFuture(response));
+        }
+        InternalTransaction tx = explicitReadOnlyTransaction();
+        assertThat(multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx),
+                willCompleteSuccessfully());
+        ArgumentCaptor<ReplicaRequest> sent = ArgumentCaptor.forClass(ReplicaRequest.class);
+        if (localExpected) {
+            verify(replicaService).invokeWithoutReplicaWait(eq(local), sent.capture());
+            verify(replicaService, never()).invoke(any(InternalClusterNode.class), any());
+            verify(placementDriver, never()).awaitPrimaryReplica(any(), any(), anyLong(), any());
+        } else {
+            verify(replicaService).invoke(eq(clusterNode), sent.capture());
+            verify(replicaService, never()).invokeWithoutReplicaWait(any(), any());
+        }
+        assertReadIdentity(tx, sent.getValue());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,unavailable", "true,unavailable", "false,wrapped", "true,wrapped",
+            "false,businessError", "true,businessError", "false,missing", "true,missing"})
+    void explicitReadOnlyFallbackPreservesSnapshotAndOnlyRetriesUnavailable(boolean multiRow, String scenario) {
+        InternalClusterNode local = new ClusterNodeImpl(randomUUID(), "backup", new NetworkAddress("host", 3001));
+        InternalTableImpl table = localReadTable(local, true);
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(completedFuture(
+                new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(local.name())), 1)));
+        Object response = multiRow ? Collections.singletonList(null) : null;
+        Throwable failure = scenario.equals("businessError") ? new IllegalArgumentException("bad data")
+                : new ReplicaUnavailableException(new ZonePartitionId(ZONE_ID, 0), local);
+        if (scenario.equals("wrapped")) {
+            failure = new CompletionException(failure);
+        }
+        when(replicaService.invokeWithoutReplicaWait(eq(local), any()))
+                .thenReturn(scenario.equals("missing") ? completedFuture(response) : failedFuture(failure));
+        boolean fallback = scenario.equals("unavailable") || scenario.equals("wrapped");
+        if (fallback) {
+            when(replicaService.invoke(eq(clusterNode), any())).thenReturn(completedFuture(response));
+        }
+        InternalTransaction tx = explicitReadOnlyTransaction();
+        CompletableFuture<?> result = multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx);
+        if (scenario.equals("businessError")) {
+            assertEquals(IllegalArgumentException.class, assertThrows(CompletionException.class, result::join).getCause().getClass());
+        } else {
+            assertThat(result, willCompleteSuccessfully());
+        }
+        ArgumentCaptor<ReplicaRequest> localRequest = ArgumentCaptor.forClass(ReplicaRequest.class);
+        verify(replicaService).invokeWithoutReplicaWait(eq(local), localRequest.capture());
+        assertReadIdentity(tx, localRequest.getValue());
+        if (fallback) {
+            ArgumentCaptor<ReplicaRequest> primaryRequest = ArgumentCaptor.forClass(ReplicaRequest.class);
+            verify(replicaService).invoke(eq(clusterNode), primaryRequest.capture());
+            assertReadIdentity(tx, primaryRequest.getValue());
+        } else {
+            verify(replicaService, never()).invoke(any(InternalClusterNode.class), any());
+            verify(placementDriver, never()).awaitPrimaryReplica(any(), any(), anyLong(), any());
+        }
+    }
+
+    private InternalTransaction explicitReadOnlyTransaction() {
+        InternalTransaction tx = mock(InternalTransaction.class);
+        lenient().when(tx.isReadOnly()).thenReturn(true);
+        lenient().when(tx.readTimestamp()).thenReturn(clock.now());
+        lenient().when(tx.id()).thenReturn(TransactionIds.transactionId(clock.now(), 1));
+        lenient().when(tx.coordinatorId()).thenReturn(randomUUID());
+        lenient().when(tx.getTimeout()).thenReturn(30_000L);
+        return tx;
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void assignmentsWaitIsBoundedAndLateCompletionDoesNotRead(boolean multiRow, boolean lateFailure) {
+        InternalTableImpl table = localReadTable(clusterNode, true);
+        CompletableFuture<TokenizedAssignments> assignments = new CompletableFuture<>();
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(assignments);
+        InternalTransaction tx = explicitReadOnlyTransaction();
+        when(tx.getTimeout()).thenReturn(200L);
+
+        CompletableFuture<?> read = multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx);
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> read.get(5, SECONDS));
+        assertEquals(REPLICA_TIMEOUT_ERR, assertInstanceOf(TransactionException.class, failure.getCause()).code());
+        assertFalse(assignments.isDone(), "A timeout must not complete the underlying assignments future");
+        if (lateFailure) {
+            assignments.completeExceptionally(new IllegalStateException("late assignments failure"));
+        } else {
+            assignments.complete(new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(clusterNode.name())), 1));
+        }
+        verify(replicaService, never()).invokeWithoutReplicaWait(any(), any());
+        verify(replicaService, never()).invoke(any(InternalClusterNode.class), any());
+        verify(placementDriver, never()).awaitPrimaryReplica(any(), any(), anyLong(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void assignmentsTimeoutDoesNotAffectAnotherReadSharingTheFuture(boolean multiRow) {
+        InternalTableImpl table = localReadTable(clusterNode, true);
+        CompletableFuture<TokenizedAssignments> assignments = new CompletableFuture<>();
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(assignments);
+        when(replicaService.invokeWithoutReplicaWait(eq(clusterNode), any()))
+                .thenReturn(completedFuture(multiRow ? Collections.singletonList(null) : null));
+        InternalTransaction shortTx = explicitReadOnlyTransaction();
+        when(shortTx.getTimeout()).thenReturn(200L);
+        InternalTransaction longTx = explicitReadOnlyTransaction();
+
+        CompletableFuture<?> shortRead = multiRow
+                ? table.getAll(List.of(createBinaryRow(0)), shortTx) : table.get(createBinaryRow(0), shortTx);
+        CompletableFuture<?> longRead = multiRow
+                ? table.getAll(List.of(createBinaryRow(0)), longTx) : table.get(createBinaryRow(0), longTx);
+
+        assertThrows(ExecutionException.class, () -> shortRead.get(5, SECONDS));
+        assertFalse(assignments.isDone());
+        assertFalse(longRead.isDone());
+        assignments.complete(new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(clusterNode.name())), 1));
+        assertThat(longRead, willCompleteSuccessfully());
+        verify(replicaService).invokeWithoutReplicaWait(eq(clusterNode), any());
+        verify(placementDriver, never()).awaitPrimaryReplica(any(), any(), anyLong(), any());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void finishedTransactionDoesNotSendAfterAssignmentsWait(boolean multiRow, boolean primaryRecipient) {
+        InternalTableImpl table = localReadTable(clusterNode, true);
+        CompletableFuture<TokenizedAssignments> assignments = new CompletableFuture<>();
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(assignments);
+        InternalTransaction tx = explicitReadOnlyTransaction();
+        AtomicBoolean finished = new AtomicBoolean();
+        when(tx.isFinishingOrFinished()).thenAnswer(invocation -> finished.get());
+        CompletableFuture<?> read = multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx);
+
+        finished.set(true);
+        assignments.complete(new TokenizedAssignmentsImpl(primaryRecipient ? Set.of() : Set.of(Assignment.forPeer(clusterNode.name())), 1));
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> read.get(5, SECONDS));
+        assertEquals(TX_ALREADY_FINISHED_ERR, assertInstanceOf(TransactionException.class, failure.getCause()).code());
+        verify(replicaService, never()).invokeWithoutReplicaWait(any(), any());
+        verify(replicaService, never()).invoke(any(InternalClusterNode.class), any());
+        verify(placementDriver, never()).awaitPrimaryReplica(any(), any(), anyLong(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void assignmentsWaitUsesRemainingTransactionTime(boolean multiRow) {
+        InternalTableImpl table = localReadTable(clusterNode, true);
+        CompletableFuture<TokenizedAssignments> assignments = new CompletableFuture<>();
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(assignments);
+        InternalTransaction tx = explicitReadOnlyTransaction();
+        when(tx.id()).thenReturn(TransactionIds.transactionId(
+                new HybridTimestamp(clock.now().getPhysical() - 10_000, 0), 1));
+        when(tx.getTimeout()).thenReturn(10_200L);
+
+        CompletableFuture<?> read = multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx);
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> read.get(5, SECONDS));
+        assertEquals(REPLICA_TIMEOUT_ERR, assertInstanceOf(TransactionException.class, failure.getCause()).code());
+        assertFalse(assignments.isDone());
+        verify(placementDriver, never()).awaitPrimaryReplica(any(), any(), anyLong(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void expiredTransactionDoesNotStartReplicaRouting(boolean multiRow) {
+        InternalTableImpl table = localReadTable(clusterNode, true);
+        InternalTransaction tx = explicitReadOnlyTransaction();
+        when(tx.id()).thenReturn(TransactionIds.transactionId(new HybridTimestamp(clock.now().getPhysical() - 1_000, 0), 1));
+        when(tx.getTimeout()).thenReturn(100L);
+
+        CompletableFuture<?> read = multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx);
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> read.get(5, SECONDS));
+        assertEquals(REPLICA_TIMEOUT_ERR, assertInstanceOf(TransactionException.class, failure.getCause()).code());
+        verify(placementDriver, never()).getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class));
+        verify(placementDriver, never()).awaitPrimaryReplica(any(), any(), anyLong(), any());
+        verify(replicaService, never()).invokeWithoutReplicaWait(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void finishedTransactionDoesNotStartPrimaryFallback(boolean multiRow) {
+        InternalTableImpl table = localReadTable(clusterNode, true);
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(completedFuture(
+                new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(clusterNode.name())), 1)));
+        CompletableFuture<Object> localResponse = new CompletableFuture<>();
+        when(replicaService.invokeWithoutReplicaWait(eq(clusterNode), any())).thenReturn(localResponse);
+        InternalTransaction tx = explicitReadOnlyTransaction();
+        AtomicBoolean finished = new AtomicBoolean();
+        when(tx.isFinishingOrFinished()).thenAnswer(invocation -> finished.get());
+        CompletableFuture<?> read = multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx);
+
+        finished.set(true);
+        localResponse.completeExceptionally(new ReplicaUnavailableException(new ZonePartitionId(ZONE_ID, 0), clusterNode));
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> read.get(5, SECONDS));
+        assertEquals(TX_ALREADY_FINISHED_ERR, assertInstanceOf(TransactionException.class, failure.getCause()).code());
+        verify(placementDriver, never()).awaitPrimaryReplica(any(), any(), anyLong(), any());
+        verify(replicaService, never()).invoke(any(InternalClusterNode.class), any());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void finishedTransactionDoesNotSendAfterPrimaryLookup(boolean multiRow, boolean fallback) {
+        InternalTableImpl table = localReadTable(clusterNode, fallback);
+        if (fallback) {
+            when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(completedFuture(
+                    new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(clusterNode.name())), 1)));
+            when(replicaService.invokeWithoutReplicaWait(eq(clusterNode), any())).thenReturn(failedFuture(
+                    new ReplicaUnavailableException(new ZonePartitionId(ZONE_ID, 0), clusterNode)));
+        }
+        CompletableFuture<ReplicaMeta> primary = new CompletableFuture<>();
+        when(placementDriver.awaitPrimaryReplica(any(), any(), anyLong(), any())).thenReturn(primary);
+        InternalTransaction tx = explicitReadOnlyTransaction();
+        AtomicBoolean finished = new AtomicBoolean();
+        when(tx.isFinishingOrFinished()).thenAnswer(invocation -> finished.get());
+        CompletableFuture<?> read = multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx);
+
+        finished.set(true);
+        primary.complete(new Lease(clusterNode.name(), clusterNode.id(), HybridTimestamp.MIN_VALUE,
+                HybridTimestamp.MAX_VALUE, new ZonePartitionId(ZONE_ID, 0)));
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> read.get(5, SECONDS));
+        assertEquals(TX_ALREADY_FINISHED_ERR, assertInstanceOf(TransactionException.class, failure.getCause()).code());
+        verify(replicaService, never()).invoke(any(InternalClusterNode.class), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void assignmentsSourceFailureStillUsesPrimary(boolean multiRow) {
+        InternalTableImpl table = localReadTable(clusterNode, true);
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class)))
+                .thenReturn(failedFuture(new TimeoutException("source lookup failure, not the private wait timer")));
+        when(replicaService.invoke(eq(clusterNode), any()))
+                .thenReturn(completedFuture(multiRow ? Collections.singletonList(null) : null));
+        InternalTransaction tx = explicitReadOnlyTransaction();
+
+        assertThat(multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx),
+                willCompleteSuccessfully());
+        verify(replicaService).invoke(eq(clusterNode), any());
+        verify(replicaService, never()).invokeWithoutReplicaWait(any(), any());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void readOnlyRoutingUsesBeginTimeAndSaturatesDeadline(boolean multiRow, boolean overflow) {
+        InternalTableImpl table = localReadTable(clusterNode, true);
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(completedFuture(
+                new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(clusterNode.name())), 1)));
+        when(replicaService.invokeWithoutReplicaWait(eq(clusterNode), any()))
+                .thenReturn(completedFuture(multiRow ? Collections.singletonList(null) : null));
+        InternalTransaction tx = explicitReadOnlyTransaction();
+        when(tx.readTimestamp()).thenReturn(HybridTimestamp.MIN_VALUE);
+        if (overflow) {
+            when(tx.getTimeout()).thenReturn(Long.MAX_VALUE);
+        }
+
+        assertThat(multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx),
+                willCompleteSuccessfully());
+        ArgumentCaptor<ReplicaRequest> request = ArgumentCaptor.forClass(ReplicaRequest.class);
+        verify(replicaService).invokeWithoutReplicaWait(eq(clusterNode), request.capture());
+        assertReadIdentity(tx, request.getValue());
+    }
+
+    @Test
+    void timestampOnlyAssignmentsWaitUsesThirtySecondLimit() {
+        InternalTableImpl table = localReadTable(clusterNode, true);
+        CompletableFuture<TokenizedAssignments> assignments = new CompletableFuture<>();
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(assignments);
+
+        CompletableFuture<?> read = table.evaluateReadOnlyRecipientNode(0, clock.now());
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> read.get(35, SECONDS));
+        assertEquals(REPLICA_TIMEOUT_ERR, assertInstanceOf(TransactionException.class, failure.getCause()).code());
+        assertFalse(assignments.isDone());
+        assignments.complete(new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(clusterNode.name())), 1));
+        verify(placementDriver, never()).awaitPrimaryReplica(any(), any(), anyLong(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void explicitlySelectedRecipientIsNotOverriddenByLocalDefault(boolean multiRow) {
+        InternalClusterNode local = new ClusterNodeImpl(randomUUID(), "backup", new NetworkAddress("host", 3001));
+        InternalTableImpl table = localReadTable(local, true);
+        HybridTimestamp timestamp = clock.now();
+        UUID transactionId = randomUUID();
+        UUID coordinatorId = randomUUID();
+        when(replicaService.invoke(eq(clusterNode), any())).thenReturn(completedFuture(
+                multiRow ? Collections.singletonList(null) : null));
+
+        assertThat(multiRow
+                ? table.getAll(List.of(createBinaryRow(0)), timestamp, transactionId, coordinatorId, clusterNode)
+                : table.get(createBinaryRow(0), timestamp, transactionId, coordinatorId, clusterNode), willCompleteSuccessfully());
+
+        ArgumentCaptor<ReplicaRequest> request = ArgumentCaptor.forClass(ReplicaRequest.class);
+        verify(replicaService).invoke(eq(clusterNode), request.capture());
+        ReadOnlyReplicaRequest read = (ReadOnlyReplicaRequest) request.getValue();
+        assertEquals(timestamp, read.readTimestamp());
+        assertEquals(transactionId, read.transactionId());
+        verify(replicaService, never()).invokeWithoutReplicaWait(any(), any());
+        verify(placementDriver, never()).getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void implicitReadStillUsesDirectPrimaryRequest(boolean multiRow) {
+        InternalClusterNode local = new ClusterNodeImpl(randomUUID(), "backup", new NetworkAddress("host", 3001));
+        InternalTableImpl table = localReadTable(local, true);
+        InternalTransaction tx = mock(InternalTransaction.class);
+        when(txManager.beginImplicitRo(any())).thenReturn(tx);
+        when(tx.schemaTimestamp()).thenReturn(clock.now());
+        when(tx.finish(anyBoolean(), any(HybridTimestamp.class), anyBoolean(), anyBoolean())).thenReturn(nullCompletedFuture());
+        when(replicaService.invoke(eq(clusterNode), any())).thenReturn(completedFuture(
+                multiRow ? Collections.singletonList(null) : null));
+
+        assertThat(multiRow ? table.getAll(List.of(createBinaryRow(0)), null) : table.get(createBinaryRow(0), null),
+                willCompleteSuccessfully());
+
+        ArgumentCaptor<ReplicaRequest> request = ArgumentCaptor.forClass(ReplicaRequest.class);
+        verify(replicaService).invoke(eq(clusterNode), request.capture());
+        assertInstanceOf(ReadOnlyDirectReplicaRequest.class, request.getValue());
+        verify(replicaService, never()).invokeWithoutReplicaWait(any(), any());
+        verify(placementDriver, never()).getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void readWriteReadDoesNotEnterLocalReadOnlyRouting(boolean multiRow) {
+        InternalClusterNode local = new ClusterNodeImpl(randomUUID(), "backup", new NetworkAddress("host", 3001));
+        InternalTableImpl table = localReadTable(local, true);
+        InternalTransaction tx = newReadWriteTransaction();
+        try {
+            assertThat(multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx),
+                    willCompleteSuccessfully());
+            verify(replicaService).invoke(eq(clusterNode.name()), any());
+            verify(replicaService, never()).invokeWithoutReplicaWait(any(), any());
+            verify(placementDriver, never()).getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class));
+        } finally {
+            tx.rollback();
+        }
+    }
+
+    private static void assertReadIdentity(InternalTransaction tx, ReplicaRequest request) {
+        ReadOnlyReplicaRequest read = (ReadOnlyReplicaRequest) request;
+        assertEquals(tx.id(), read.transactionId());
+        assertEquals(tx.coordinatorId(), read.coordinatorId());
+        assertEquals(tx.readTimestamp(), read.readTimestamp());
+    }
+
+    private InternalTableImpl localReadTable(InternalClusterNode local, boolean ready) {
+        return new InternalTableImpl(
+                QualifiedName.fromSimple("test"), ZONE_ID, TABLE_ID, 1,
+                new SingleClusterNodeResolver(clusterNode), txManager,
+                mock(MvTableStorage.class), mock(TxStateStorage.class), replicaService,
+                clockService, HybridTimestampTracker.atomicTracker(null), placementDriver,
+                new TransactionInflights(placementDriver, clockService),
+                () -> mock(ScheduledExecutorService.class), mock(StreamerReceiverRunner.class),
+                () -> 10_000L, () -> 10_000L, colocationEnabled(),
+                new TableMetricSource(QualifiedName.fromSimple("test")), () -> local, groupId -> ready
+        );
     }
 
     private InternalTableImpl newInternalTable(int tableId, int partitionCount) {

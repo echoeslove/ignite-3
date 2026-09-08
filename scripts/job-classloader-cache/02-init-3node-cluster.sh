@@ -12,6 +12,12 @@ ACTION="${1:-start}"
 USE_LAUNCHCTL="${IGNITE_USE_LAUNCHCTL:-true}"
 PORT_OFFSET="${IGNITE_PORT_OFFSET:-0}"
 NODE_HEAP="${IGNITE_NODE_HEAP:-1g}"
+NODE_COUNT="${IGNITE_NODE_COUNT:-3}"
+
+if ! [[ "${NODE_COUNT}" =~ ^[0-9]+$ ]] || [[ "${NODE_COUNT}" -lt 3 ]]; then
+    echo "ERROR: IGNITE_NODE_COUNT must be an integer of at least 3" >&2
+    exit 2
+fi
 
 if [[ ! -f "${ARTIFACT_MANIFEST}" ]]; then
     echo "ERROR: Build manifest not found. Run 01-build-ignite.sh first." >&2
@@ -22,10 +28,17 @@ fi
 source "${ARTIFACT_MANIFEST}"
 
 JAVA_HOME="${JAVA_HOME:-$(java -XshowSettings:properties -version 2>&1 | awk -F'= ' '/java.home =/{print $2; exit}')}"
+EXPECTED_RUNTIME_JAVA_MAJOR="${IGNITE_RUNTIME_JAVA_MAJOR:-25}"
 
-JAVA_MAJOR="$(java -XshowSettings:properties -version 2>&1 | awk -F'= ' '/java.version =/{split($2, parts, "."); print parts[1]; exit}')"
-if [[ "${JAVA_MAJOR}" != "25" ]]; then
-    echo "ERROR: JDK 25 is required, current java.version=${JAVA_MAJOR}" >&2
+if [[ ! -x "${JAVA_HOME}/bin/java" || ! -x "${JAVA_HOME}/bin/jcmd" ]]; then
+    echo "ERROR: Runtime JDK is invalid: ${JAVA_HOME}" >&2
+    exit 1
+fi
+
+ACTUAL_RUNTIME_JAVA_MAJOR="$("${JAVA_HOME}/bin/java" -XshowSettings:properties -version 2>&1 \
+    | awk -F'= ' '/java.version =/{split($2, parts, "."); print parts[1]; exit}')"
+if [[ "${ACTUAL_RUNTIME_JAVA_MAJOR}" != "${EXPECTED_RUNTIME_JAVA_MAJOR}" ]]; then
+    echo "ERROR: JDK ${EXPECTED_RUNTIME_JAVA_MAJOR} is required, current java.version=${ACTUAL_RUNTIME_JAVA_MAJOR}" >&2
     exit 1
 fi
 
@@ -143,7 +156,7 @@ stop_node() {
 }
 
 stop_all() {
-    for index in 1 2 3; do
+    for index in $(seq 1 "${NODE_COUNT}"); do
         stop_node "${index}"
     done
 }
@@ -202,6 +215,20 @@ start_node() {
     echo "node${index}: ready on REST ${port}, PID ${pid}"
 }
 
+start_nodes() {
+    if [[ "$#" -eq 0 ]]; then
+        echo "ERROR: at least one node index is required" >&2
+        return 2
+    fi
+
+    for index in "$@"; do
+        start_node "${index}"
+    done
+
+    wait_for_logical_topology "${NODE_COUNT}"
+    show_status
+}
+
 write_node_configuration() {
     local index="$1"
     local dir network_port client_port rest_port vars_file
@@ -216,8 +243,15 @@ write_node_configuration() {
         -e "s/^JVM_MAX_MEM=.*/JVM_MAX_MEM=\"${NODE_HEAP}\"/" \
         -e "s/^JVM_MIN_MEM=.*/JVM_MIN_MEM=\"${NODE_HEAP}\"/" \
         -e 's/^JVM_G1HeapRegionSize=.*/JVM_G1HeapRegionSize="4M"/' \
-        -e 's|^IGNITE3_EXTRA_JVM_ARGS=.*|IGNITE3_EXTRA_JVM_ARGS="-XX:NativeMemoryTracking=summary -XX:+UnlockDiagnosticVMOptions -XX:+ClassUnloadingWithConcurrentMark -Xlog:class+unload=info"|' \
+        -e "s|^IGNITE3_EXTRA_JVM_ARGS=.*|IGNITE3_EXTRA_JVM_ARGS=\"-XX:NativeMemoryTracking=summary -XX:+UnlockDiagnosticVMOptions -XX:+ClassUnloadingWithConcurrentMark -Xlog:class+unload=info -Xlog:gc*:file=${dir}/log/gc.log:time,uptime,level,tags:filecount=5,filesize=20M\"|" \
         "${vars_file}"
+
+    local node_finder_entries=""
+    local peer
+    for peer in $(seq 1 "${NODE_COUNT}"); do
+        node_finder_entries+="            \"127.0.0.1:$(node_network_port "${peer}")\","
+    done
+    node_finder_entries="${node_finder_entries%,}"
 
     if [[ "${IGNITE_BASELINE_NO_CACHE:-false}" == "true" ]]; then
         cat > "${dir}/etc/ignite-config.conf" <<EOF
@@ -225,9 +259,7 @@ ignite {
     network {
         port: ${network_port}
         nodeFinder.netClusterNodes: [
-            "127.0.0.1:$(node_network_port 1)",
-            "127.0.0.1:$(node_network_port 2)",
-            "127.0.0.1:$(node_network_port 3)"
+${node_finder_entries}
         ]
     }
     clientConnector.port: ${client_port}
@@ -240,9 +272,7 @@ ignite {
     network {
         port: ${network_port}
         nodeFinder.netClusterNodes: [
-            "127.0.0.1:$(node_network_port 1)",
-            "127.0.0.1:$(node_network_port 2)",
-            "127.0.0.1:$(node_network_port 3)"
+${node_finder_entries}
         ]
     }
     clientConnector.port: ${client_port}
@@ -274,7 +304,7 @@ prepare_runtime() {
         exit 1
     fi
 
-    for index in 1 2 3; do
+    for index in $(seq 1 "${NODE_COUNT}"); do
         cp -R "${db_template}" "$(node_dir "${index}")"
         write_node_configuration "${index}"
     done
@@ -292,7 +322,7 @@ run_cli() {
 
 show_status() {
     local failures=0
-    for index in 1 2 3; do
+    for index in $(seq 1 "${NODE_COUNT}"); do
         local file pid state version
         file="$(pid_file "${index}")"
         pid="$(test -f "${file}" && tr -d '[:space:]' < "${file}" || true)"
@@ -313,20 +343,27 @@ show_status() {
     local topology
     topology="$(curl -fsS "http://127.0.0.1:$(node_rest_port 1)/management/v1/cluster/topology/logical")"
     echo "logicalTopology=${topology}"
-    JSON="${topology}" python3 -c 'import json,os,sys; data=json.loads(os.environ["JSON"]); sys.exit(0 if len(data)==3 else 1)'
+    JSON="${topology}" EXPECTED="${NODE_COUNT}" python3 -c 'import json,os,sys; data=json.loads(os.environ["JSON"]); sys.exit(0 if len(data)==int(os.environ["EXPECTED"]) else 1)'
 }
 
 case "${ACTION}" in
     start)
         prepare_runtime
-        for index in 1 2 3; do
+        for index in $(seq 1 "${NODE_COUNT}"); do
             start_node "${index}"
         done
         sleep 2
         run_cli cluster init --url "http://127.0.0.1:$(node_rest_port 1)" --name "${CLUSTER_NAME}" \
             --cluster-management-group node1,node2,node3 \
             --metastorage-group node1,node2,node3
-        wait_for_logical_topology 3
+        wait_for_logical_topology "${NODE_COUNT}"
+        show_status
+        ;;
+    start-existing)
+        for index in $(seq 1 "${NODE_COUNT}"); do
+            start_node "${index}"
+        done
+        wait_for_logical_topology "${NODE_COUNT}"
         show_status
         ;;
     status)
@@ -340,15 +377,19 @@ case "${ACTION}" in
         ;;
     start-node)
         start_node "${2:?node index is required}"
-        wait_for_logical_topology 3
+        wait_for_logical_topology "${NODE_COUNT}"
+        ;;
+    start-nodes)
+        shift
+        start_nodes "$@"
         ;;
     restart-node)
         stop_node "${2:?node index is required}"
         start_node "$2"
-        wait_for_logical_topology 3
+        wait_for_logical_topology "${NODE_COUNT}"
         ;;
     *)
-        echo "Usage: $0 start|status|stop|stop-node N|start-node N|restart-node N" >&2
+        echo "Usage: $0 start|start-existing|status|stop|stop-node N|start-node N|start-nodes N...|restart-node N" >&2
         exit 2
         ;;
 esac

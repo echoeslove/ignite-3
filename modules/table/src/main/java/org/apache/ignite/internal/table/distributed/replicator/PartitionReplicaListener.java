@@ -161,6 +161,7 @@ import org.apache.ignite.internal.replicator.ReplicatorRecoverableExceptions;
 import org.apache.ignite.internal.replicator.TablePartitionId;
 import org.apache.ignite.internal.replicator.ZonePartitionId;
 import org.apache.ignite.internal.replicator.exception.PrimaryReplicaMissException;
+import org.apache.ignite.internal.replicator.exception.ReplicaUnavailableException;
 import org.apache.ignite.internal.replicator.exception.ReplicationException;
 import org.apache.ignite.internal.replicator.exception.UnsupportedReplicaRequestException;
 import org.apache.ignite.internal.replicator.listener.ReplicaListener;
@@ -226,6 +227,7 @@ import org.apache.ignite.internal.util.IgniteSpinBusyLock;
 import org.apache.ignite.internal.util.IgniteUtils;
 import org.apache.ignite.internal.util.Lazy;
 import org.apache.ignite.internal.util.PendingComparableValuesTracker;
+import org.apache.ignite.internal.util.TrackerClosedException;
 import org.apache.ignite.lang.ErrorGroups.Replicator;
 import org.apache.ignite.lang.ErrorGroups.Transactions;
 import org.apache.ignite.lang.IgniteException;
@@ -307,6 +309,9 @@ public class PartitionReplicaListener implements ReplicaListener, ReplicaTablePr
 
     /** Safe time. */
     private final PendingComparableValuesTracker<HybridTimestamp, Void> safeTime;
+
+    /** Node hosting this replica. */
+    private final InternalClusterNode localNode;
 
     /** Transaction state resolver. */
     private final TransactionStateResolver transactionStateResolver;
@@ -429,6 +434,7 @@ public class PartitionReplicaListener implements ReplicaListener, ReplicaTablePr
         this.secondaryIndexStorages = secondaryIndexStorages;
         this.clockService = clockService;
         this.safeTime = safeTime;
+        this.localNode = localNode;
         this.transactionStateResolver = transactionStateResolver;
         this.storageUpdateHandler = storageUpdateHandler;
         this.schemaSyncService = schemaSyncService;
@@ -1088,7 +1094,7 @@ public class PartitionReplicaListener implements ReplicaListener, ReplicaTablePr
 
         CompletableFuture<Void> safeReadFuture = isPrimaryInTimestamp(isPrimary, readTimestamp)
                 ? nullCompletedFuture()
-                : safeTime.waitFor(request.readTimestamp());
+                : waitForSafeTimeForRead(readTimestamp);
 
         return safeReadFuture.thenCompose(unused -> resolveRowByPkForReadOnly(primaryKey, readTimestamp));
     }
@@ -1102,6 +1108,20 @@ public class PartitionReplicaListener implements ReplicaListener, ReplicaTablePr
      */
     private boolean isPrimaryInTimestamp(boolean isPrimary, HybridTimestamp timestamp) {
         return isPrimary && clockService.now().compareTo(timestamp) > 0;
+    }
+
+    /** Reports a stopped replica without making ordinary safe-time delays or read failures retryable. */
+    private CompletableFuture<Void> waitForSafeTimeForRead(HybridTimestamp readTimestamp) {
+        CompletableFuture<Void> wait = safeTime.waitFor(readTimestamp);
+        return wait.<CompletableFuture<Void>>handle((unused, error) -> {
+            if (error == null) {
+                return nullCompletedFuture();
+            }
+
+            return failedFuture(unwrapCause(error) instanceof TrackerClosedException
+                    ? new ReplicaUnavailableException(replicationGroupId, localNode, error)
+                    : error);
+        }).thenCompose(future -> future);
     }
 
     /**
@@ -1126,7 +1146,7 @@ public class PartitionReplicaListener implements ReplicaListener, ReplicaTablePr
 
         CompletableFuture<Void> safeReadFuture = isPrimaryInTimestamp(isPrimary, readTimestamp)
                 ? nullCompletedFuture()
-                : safeTime.waitFor(request.readTimestamp());
+                : waitForSafeTimeForRead(readTimestamp);
 
         return safeReadFuture.thenCompose(unused -> {
             CompletableFuture<BinaryRow>[] resolutionFuts = new CompletableFuture[primaryKeys.size()];

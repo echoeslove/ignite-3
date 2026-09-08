@@ -21,6 +21,7 @@ import static it.unimi.dsi.fastutil.ints.Int2ObjectMaps.emptyMap;
 import static java.util.concurrent.CompletableFuture.allOf;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.concurrent.CompletableFuture.failedFuture;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.function.Function.identity;
 import static org.apache.ignite.internal.lang.IgniteStringFormatter.format;
@@ -47,6 +48,7 @@ import static org.apache.ignite.internal.table.distributed.storage.RowBatch.allR
 import static org.apache.ignite.internal.util.CompletableFutures.completedOrFailedFuture;
 import static org.apache.ignite.internal.util.CompletableFutures.emptyListCompletedFuture;
 import static org.apache.ignite.internal.util.CompletableFutures.nullCompletedFuture;
+import static org.apache.ignite.internal.util.ExceptionUtils.hasCause;
 import static org.apache.ignite.internal.util.ExceptionUtils.matchAny;
 import static org.apache.ignite.internal.util.ExceptionUtils.sneakyThrow;
 import static org.apache.ignite.internal.util.ExceptionUtils.unwrapCause;
@@ -55,6 +57,7 @@ import static org.apache.ignite.internal.util.FastTimestamps.coarseCurrentTimeMi
 import static org.apache.ignite.lang.ErrorGroups.Common.INTERNAL_ERR;
 import static org.apache.ignite.lang.ErrorGroups.Replicator.GROUP_OVERLOADED_ERR;
 import static org.apache.ignite.lang.ErrorGroups.Replicator.REPLICA_MISS_ERR;
+import static org.apache.ignite.lang.ErrorGroups.Replicator.REPLICA_TIMEOUT_ERR;
 import static org.apache.ignite.lang.ErrorGroups.Replicator.REPLICA_UNAVAILABLE_ERR;
 import static org.apache.ignite.lang.ErrorGroups.Transactions.ACQUIRE_LOCK_ERR;
 import static org.apache.ignite.lang.ErrorGroups.Transactions.TX_ALREADY_FINISHED_ERR;
@@ -76,9 +79,11 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Flow.Publisher;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import org.apache.ignite.internal.binarytuple.BinaryTupleReader;
 import org.apache.ignite.internal.hlc.ClockService;
@@ -92,19 +97,24 @@ import org.apache.ignite.internal.partition.replicator.network.PartitionReplicat
 import org.apache.ignite.internal.partition.replicator.network.replication.BinaryTupleMessage;
 import org.apache.ignite.internal.partition.replicator.network.replication.ReadOnlyMultiRowPkReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.ReadOnlyScanRetrieveBatchReplicaRequest;
+import org.apache.ignite.internal.partition.replicator.network.replication.ReadOnlySingleRowPkReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.ReadWriteMultiRowPkReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.ReadWriteMultiRowReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.ReadWriteReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.ReadWriteScanRetrieveBatchReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.network.replication.RequestType;
 import org.apache.ignite.internal.partition.replicator.network.replication.ScanCloseReplicaRequest;
+import org.apache.ignite.internal.partitiondistribution.Assignment;
+import org.apache.ignite.internal.partitiondistribution.TokenizedAssignments;
 import org.apache.ignite.internal.placementdriver.PlacementDriver;
 import org.apache.ignite.internal.placementdriver.ReplicaMeta;
 import org.apache.ignite.internal.replicator.ReplicaService;
 import org.apache.ignite.internal.replicator.ReplicationGroupId;
 import org.apache.ignite.internal.replicator.TablePartitionId;
 import org.apache.ignite.internal.replicator.ZonePartitionId;
+import org.apache.ignite.internal.replicator.exception.AwaitReplicaTimeoutException;
 import org.apache.ignite.internal.replicator.exception.PrimaryReplicaMissException;
+import org.apache.ignite.internal.replicator.exception.ReplicaUnavailableException;
 import org.apache.ignite.internal.replicator.exception.ReplicationException;
 import org.apache.ignite.internal.replicator.exception.ReplicationTimeoutException;
 import org.apache.ignite.internal.replicator.message.ReplicaMessagesFactory;
@@ -214,6 +224,12 @@ public class InternalTableImpl implements InternalTable {
 
     private final TableMetricSource metrics;
 
+    /** Supplies the local node for local-first read-only replica routing. */
+    private final Supplier<@Nullable InternalClusterNode> localNodeSupplier;
+
+    /** Checks whether a local replica is ready to accept a request. */
+    private final Predicate<ReplicationGroupId> localReplicaReady;
+
     /**
      * Constructor.
      *
@@ -255,6 +271,57 @@ public class InternalTableImpl implements InternalTable {
             boolean colocationEnabled,
             TableMetricSource metrics
     ) {
+        this(
+                tableName,
+                zoneId,
+                tableId,
+                partitions,
+                clusterNodeResolver,
+                txManager,
+                tableStorage,
+                txStateStorage,
+                replicaSvc,
+                clockService,
+                observableTimestampTracker,
+                placementDriver,
+                transactionInflights,
+                streamerFlushExecutor,
+                streamerReceiverRunner,
+                defaultRwTxTimeout,
+                defaultReadTxTimeout,
+                colocationEnabled,
+                metrics,
+                () -> null,
+                groupId -> false
+        );
+    }
+
+    /**
+     * Constructor with local stable-peer routing for explicit read-only transactions.
+     */
+    public InternalTableImpl(
+            QualifiedName tableName,
+            int zoneId,
+            int tableId,
+            int partitions,
+            ClusterNodeResolver clusterNodeResolver,
+            TxManager txManager,
+            MvTableStorage tableStorage,
+            TxStateStorage txStateStorage,
+            ReplicaService replicaSvc,
+            ClockService clockService,
+            HybridTimestampTracker observableTimestampTracker,
+            PlacementDriver placementDriver,
+            TransactionInflights transactionInflights,
+            Supplier<ScheduledExecutorService> streamerFlushExecutor,
+            StreamerReceiverRunner streamerReceiverRunner,
+            Supplier<Long> defaultRwTxTimeout,
+            Supplier<Long> defaultReadTxTimeout,
+            boolean colocationEnabled,
+            TableMetricSource metrics,
+            Supplier<@Nullable InternalClusterNode> localNodeSupplier,
+            Predicate<ReplicationGroupId> localReplicaReady
+    ) {
         this.tableName = tableName;
         this.zoneId = zoneId;
         this.tableId = tableId;
@@ -274,6 +341,8 @@ public class InternalTableImpl implements InternalTable {
         this.defaultReadTxTimeout = defaultReadTxTimeout;
         this.colocationEnabled = colocationEnabled;
         this.metrics = metrics;
+        this.localNodeSupplier = localNodeSupplier;
+        this.localReplicaReady = localReplicaReady;
     }
 
     /** {@inheritDoc} */
@@ -939,8 +1008,19 @@ public class InternalTableImpl implements InternalTable {
         }
 
         if (tx.isReadOnly()) {
-            return evaluateReadOnlyRecipientNode(partitionId(keyRow), tx.readTimestamp())
-                    .thenCompose(recipientNode -> get(keyRow, tx.readTimestamp(), tx.id(), tx.coordinatorId(), recipientNode));
+            return invokeReadOnlyOnPreferredReplica(
+                    partitionId(keyRow),
+                    tx.readTimestamp(),
+                    tx,
+                    (recipientNode, failFastIfReplicaUnavailable) -> get(
+                            keyRow,
+                            tx.readTimestamp(),
+                            tx.id(),
+                            tx.coordinatorId(),
+                            recipientNode,
+                            failFastIfReplicaUnavailable
+                    )
+            );
         }
 
         return enlistInTx(
@@ -971,10 +1051,20 @@ public class InternalTableImpl implements InternalTable {
             @Nullable UUID coordinatorId,
             InternalClusterNode recipientNode
     ) {
-        int partId = partitionId(keyRow);
-        ReplicationGroupId replicationGroupId = targetReplicationGroupId(partId);
+        return get(keyRow, readTimestamp, transactionId, coordinatorId, recipientNode, false);
+    }
 
-        return replicaSvc.invoke(recipientNode, TABLE_MESSAGES_FACTORY.readOnlySingleRowPkReplicaRequest()
+    private CompletableFuture<BinaryRow> get(
+            BinaryRowEx keyRow,
+            HybridTimestamp readTimestamp,
+            @Nullable UUID transactionId,
+            @Nullable UUID coordinatorId,
+            InternalClusterNode recipientNode,
+            boolean failFastIfReplicaUnavailable
+    ) {
+        ReplicationGroupId replicationGroupId = targetReplicationGroupId(partitionId(keyRow));
+
+        ReadOnlySingleRowPkReplicaRequest request = TABLE_MESSAGES_FACTORY.readOnlySingleRowPkReplicaRequest()
                 .groupId(serializeReplicationGroupId(replicationGroupId))
                 .tableId(tableId)
                 .schemaVersion(keyRow.schemaVersion())
@@ -983,8 +1073,20 @@ public class InternalTableImpl implements InternalTable {
                 .readTimestamp(readTimestamp)
                 .transactionId(transactionId)
                 .coordinatorId(coordinatorId)
-                .build()
-        );
+                .build();
+
+        return invokeReadOnlyReplica(recipientNode, request, failFastIfReplicaUnavailable);
+    }
+
+    private <T> CompletableFuture<T> invokeReadOnlyReplica(
+            InternalClusterNode node,
+            ReplicaRequest request,
+            boolean failFastIfReplicaUnavailable
+    ) {
+        if (failFastIfReplicaUnavailable) {
+            return replicaSvc.invokeWithoutReplicaWait(node, request);
+        }
+        return replicaSvc.invoke(node, request);
     }
 
     /**
@@ -1035,7 +1137,7 @@ public class InternalTableImpl implements InternalTable {
         if (tx != null && tx.isReadOnly()) {
             assert !tx.implicit() : "implicit RO getAll not supported";
 
-            return getAll(keyRows, tx.readTimestamp(), tx.id(), tx.coordinatorId(), null);
+            return getAll(keyRows, tx.readTimestamp(), tx.id(), tx.coordinatorId(), null, tx);
         }
 
         return enlistInTx(
@@ -1057,6 +1159,17 @@ public class InternalTableImpl implements InternalTable {
             @Nullable UUID coordinatorId,
             @Nullable InternalClusterNode recipientNode
     ) {
+        return getAll(keyRows, readTimestamp, transactionId, coordinatorId, recipientNode, null);
+    }
+
+    private CompletableFuture<List<BinaryRow>> getAll(
+            Collection<BinaryRowEx> keyRows,
+            HybridTimestamp readTimestamp,
+            @Nullable UUID transactionId,
+            @Nullable UUID coordinatorId,
+            @Nullable InternalClusterNode recipientNode,
+            @Nullable InternalTransaction tx
+    ) {
         Int2ObjectMap<RowBatch> rowBatchByPartitionId = toRowBatchByPartitionId(keyRows);
 
         for (Int2ObjectMap.Entry<RowBatch> partitionRowBatch : rowBatchByPartitionId.int2ObjectEntrySet()) {
@@ -1077,8 +1190,13 @@ public class InternalTableImpl implements InternalTable {
 
             partitionRowBatch.getValue().resultFuture = recipientNode != null
                     ? replicaSvc.invoke(recipientNode, request)
-                    : evaluateReadOnlyRecipientNode(partitionId, readTimestamp)
-                            .thenCompose(targetNode -> replicaSvc.invoke(targetNode, request));
+                    : invokeReadOnlyOnPreferredReplica(
+                            partitionId,
+                            readTimestamp,
+                            tx,
+                            (targetNode, failFastIfReplicaUnavailable) -> invokeReadOnlyReplica(
+                                    targetNode, request, failFastIfReplicaUnavailable)
+                    );
         }
 
         return collectMultiRowsResponsesWithRestoreOrder(rowBatchByPartitionId.values());
@@ -2160,6 +2278,51 @@ public class InternalTableImpl implements InternalTable {
 
     // TODO: IGNITE-17963 Use smarter logic for recipient node evaluation.
 
+    private <T> CompletableFuture<T> invokeReadOnlyOnPreferredReplica(
+            int partId,
+            HybridTimestamp readTimestamp,
+            @Nullable InternalTransaction tx,
+            BiFunction<InternalClusterNode, Boolean, CompletableFuture<T>> request
+    ) {
+        return evaluateReadOnlyRecipient(partId, readTimestamp, tx)
+                .thenCompose(recipient -> {
+                    readOnlyRoutingWaitMillis(tx);
+
+                    return request.apply(recipient.node, recipient.localAttempt)
+                            .<CompletableFuture<T>>handle((result, error) -> {
+                                if (error == null || !recipient.localAttempt || !isLocalReplicaUnavailable(error)) {
+                                    return error == null ? completedFuture(result) : failedFuture(error);
+                                }
+
+                                readOnlyRoutingWaitMillis(tx);
+
+                                return evaluateReadOnlyPrimaryRecipientNode(targetReplicationGroupId(partId), readTimestamp)
+                                        .thenCompose(primaryNode -> {
+                                            readOnlyRoutingWaitMillis(tx);
+
+                                            return request.apply(primaryNode, false);
+                                        });
+                            })
+                            .thenCompose(identity());
+                });
+    }
+
+    /** Captures the routing decision, including whether this operation actually chose a local replica attempt. */
+    private static final class ReadOnlyRecipient {
+        private final InternalClusterNode node;
+
+        private final boolean localAttempt;
+
+        private ReadOnlyRecipient(InternalClusterNode node, boolean localAttempt) {
+            this.node = node;
+            this.localAttempt = localAttempt;
+        }
+    }
+
+    private static boolean isLocalReplicaUnavailable(Throwable error) {
+        return hasCause(error, ReplicaUnavailableException.class) || hasCause(error, AwaitReplicaTimeoutException.class);
+    }
+
     /**
      * Evaluated cluster node for read-only request processing.
      *
@@ -2168,8 +2331,103 @@ public class InternalTableImpl implements InternalTable {
      * @return Cluster node to evaluate read-only request.
      */
     protected CompletableFuture<InternalClusterNode> evaluateReadOnlyRecipientNode(int partId, HybridTimestamp readTimestamp) {
-        ReplicationGroupId replicationGroupId = targetReplicationGroupId(partId);
+        return evaluateReadOnlyRecipient(partId, readTimestamp, null).thenApply(recipient -> recipient.node);
+    }
 
+    private CompletableFuture<ReadOnlyRecipient> evaluateReadOnlyRecipient(
+            int partId,
+            HybridTimestamp readTimestamp,
+            @Nullable InternalTransaction tx
+    ) {
+        ReplicationGroupId replicationGroupId = targetReplicationGroupId(partId);
+        long waitMillis;
+
+        try {
+            waitMillis = readOnlyRoutingWaitMillis(tx);
+        } catch (TransactionException e) {
+            return failedFuture(e);
+        }
+
+        InternalClusterNode localNode = localNodeSupplier.get();
+
+        if (localNode != null && localReplicaReady.test(replicationGroupId)) {
+            // The handle stage is request-private. Timeout must not complete the shared assignments/tracker future.
+            // Preserve Primary routing for assignments lookup errors, but do not swallow this stage's timeout.
+            return placementDriver.getAssignments(replicationGroupId, readTimestamp)
+                    .handle((assignments, e) -> localStablePeerOrNull(assignments, localNode))
+                    .orTimeout(waitMillis, MILLISECONDS)
+                    .handle((localPeer, error) -> {
+                        if (error != null) {
+                            if (unwrapCause(error) instanceof TimeoutException) {
+                                throw new TransactionException(REPLICA_TIMEOUT_ERR, format(
+                                        "Timed out waiting for read-only replica assignments [replicationGroupId={}, readTimestamp={}]",
+                                        replicationGroupId, readTimestamp), error);
+                            }
+
+                            sneakyThrow(error);
+                        }
+
+                        return localPeer;
+                    })
+                    .thenCompose(localPeer -> {
+                        readOnlyRoutingWaitMillis(tx);
+
+                        return localPeer == null
+                                ? evaluateReadOnlyPrimaryRecipientNode(replicationGroupId, readTimestamp)
+                                        .thenApply(node -> new ReadOnlyRecipient(node, false))
+                                : completedFuture(new ReadOnlyRecipient(localPeer, true));
+                    });
+        }
+
+        return evaluateReadOnlyPrimaryRecipientNode(replicationGroupId, readTimestamp)
+                .thenApply(node -> new ReadOnlyRecipient(node, false));
+    }
+
+    /** Bounds only the new routing wait; it does not change the lifetime of an already sent replica request. */
+    private long readOnlyRoutingWaitMillis(@Nullable InternalTransaction tx) {
+        long routingTimeoutMillis = SECONDS.toMillis(AWAIT_PRIMARY_REPLICA_TIMEOUT);
+
+        if (tx == null) {
+            return routingTimeoutMillis;
+        }
+
+        checkTransactionFinishStarted(tx);
+
+        // Match TransactionExpirationRegistry: RO readTimestamp can precede the transaction's begin timestamp.
+        long beginMillis = TransactionIds.beginTimestamp(tx.id()).getPhysical();
+        long timeoutMillis = tx.getTimeout();
+        long deadlineMillis = timeoutMillis > Long.MAX_VALUE - beginMillis ? Long.MAX_VALUE : beginMillis + timeoutMillis;
+        long remainingMillis = deadlineMillis - clockService.current().getPhysical();
+
+        if (remainingMillis <= 0) {
+            throw new TransactionException(REPLICA_TIMEOUT_ERR,
+                    format("Read-only transaction deadline exceeded during replica routing [txId={}]", tx.id()));
+        }
+
+        return Math.min(routingTimeoutMillis, remainingMillis);
+    }
+
+    private static @Nullable InternalClusterNode localStablePeerOrNull(
+            @Nullable TokenizedAssignments assignments,
+            InternalClusterNode localNode
+    ) {
+        if (assignments == null) {
+            return null;
+        }
+
+        for (Assignment assignment : assignments.nodes()) {
+            if (assignment.isPeer() && assignment.consistentId().equals(localNode.name())) {
+                return localNode;
+            }
+        }
+
+        return null;
+    }
+
+    private CompletableFuture<InternalClusterNode> evaluateReadOnlyPrimaryRecipientNode(
+            ReplicationGroupId replicationGroupId,
+            HybridTimestamp readTimestamp
+    ) {
         return awaitPrimaryReplica(replicationGroupId, readTimestamp)
                 .handle((res, e) -> {
                     if (e != null) {

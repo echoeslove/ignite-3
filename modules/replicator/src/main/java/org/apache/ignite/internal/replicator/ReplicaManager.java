@@ -794,6 +794,20 @@ public class ReplicaManager extends AbstractEventProducer<LocalReplicaEvent, Loc
     }
 
     /**
+     * Returns whether a local replica has completed startup and can accept replica requests.
+     *
+     * <p>The returned value is a point-in-time readiness check only. Callers must still handle a concurrent stop or restart.
+     *
+     * @param replicationGroupId Replication group identifier.
+     * @return {@code true} if the replica is started successfully.
+     */
+    public boolean isReplicaReady(ReplicationGroupId replicationGroupId) {
+        CompletableFuture<Replica> replicaFuture = replicas.get(replicationGroupId);
+
+        return replicaFuture != null && isCompletedSuccessfully(replicaFuture);
+    }
+
+    /**
      * Performs a {@code resetPeers} operation on raft node.
      *
      * @param replicaGrpId Replication group ID.
