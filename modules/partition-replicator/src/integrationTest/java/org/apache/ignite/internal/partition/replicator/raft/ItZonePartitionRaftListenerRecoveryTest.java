@@ -78,6 +78,7 @@ import org.apache.ignite.internal.network.StaticNodeFinder;
 import org.apache.ignite.internal.partition.replicator.network.PartitionReplicationMessagesFactory;
 import org.apache.ignite.internal.partition.replicator.network.command.TimedBinaryRowMessage;
 import org.apache.ignite.internal.partition.replicator.network.command.UpdateCommand;
+import org.apache.ignite.internal.partition.replicator.raft.snapshot.LogStorageAccessImpl;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.PartitionMvStorageAccess;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.PartitionSnapshotStorage;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.PartitionSnapshotStorageFactory;
@@ -97,6 +98,7 @@ import org.apache.ignite.internal.raft.server.RaftGroupOptions;
 import org.apache.ignite.internal.raft.service.RaftGroupService;
 import org.apache.ignite.internal.raft.storage.LogStorageFactory;
 import org.apache.ignite.internal.raft.util.SharedLogStorageFactoryUtils;
+import org.apache.ignite.internal.replicator.ReplicaManager;
 import org.apache.ignite.internal.replicator.ZonePartitionId;
 import org.apache.ignite.internal.replicator.message.ReplicaMessagesFactory;
 import org.apache.ignite.internal.schema.BinaryRowImpl;
@@ -234,7 +236,8 @@ class ItZonePartitionRaftListenerRecoveryTest extends IgniteAbstractTest {
             @InjectConfiguration RaftConfiguration raftConfiguration,
             @InjectExecutorService ScheduledExecutorService scheduledExecutorService,
             @Mock Catalog catalog,
-            @Mock CatalogIndexDescriptor catalogIndexDescriptor
+            @Mock CatalogIndexDescriptor catalogIndexDescriptor,
+            @Mock ReplicaManager replicaManager
     ) {
         when(catalogService.activeCatalog(anyLong())).thenReturn(catalog);
         when(catalog.indexes(anyInt())).thenReturn(List.of(catalogIndexDescriptor));
@@ -308,7 +311,8 @@ class ItZonePartitionRaftListenerRecoveryTest extends IgniteAbstractTest {
                 new PartitionTxStateAccessImpl(txStateStorage.getOrCreatePartitionStorage(PARTITION_ID.partitionId())),
                 catalogService,
                 failureProcessor,
-                executor
+                executor,
+                new LogStorageAccessImpl(replicaManager)
         );
     }
 

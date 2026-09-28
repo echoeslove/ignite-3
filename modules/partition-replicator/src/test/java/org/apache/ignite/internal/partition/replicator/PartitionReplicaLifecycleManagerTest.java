@@ -217,34 +217,6 @@ class PartitionReplicaLifecycleManagerTest extends BaseIgniteAbstractTest {
                 commonStorageIndexTracker
         ));
 
-        zoneResourcesManager = spy(new ZoneResourcesManager(
-                sharedTxStateStorage,
-                txManager,
-                outgoingSnapshotsManager,
-                topologyService,
-                catalogService,
-                failureManager,
-                executorService
-        ) {
-            @Override
-            protected TxStateStorage createTxStateStorage(int zoneId, int partitionCount) {
-                TxStateStorage txStateStorage = new TxStateRocksDbStorage(zoneId, partitionCount, sharedTxStateStorage) {
-                    @Override
-                    public TxStateRocksDbPartitionStorage createPartitionStorage(int partitionId) {
-                        return txStatePartitionStorage;
-                    }
-                };
-
-                if (ThreadAssertions.enabled()) {
-                    txStateStorage = new ThreadAssertingTxStateStorage(txStateStorage);
-                }
-
-                txStateStorage.start();
-
-                return txStateStorage;
-            }
-        });
-
         when(raftManager.startRaftGroupNode(any(), any(), any(), any(), any(RaftGroupOptions.class), any()))
                 .thenReturn(topologyAwareRaftGroupService);
 
@@ -277,6 +249,35 @@ class PartitionReplicaLifecycleManagerTest extends BaseIgniteAbstractTest {
                 executorService,
                 groupId -> nullCompletedFuture()
         ));
+
+        zoneResourcesManager = spy(new ZoneResourcesManager(
+                sharedTxStateStorage,
+                txManager,
+                outgoingSnapshotsManager,
+                topologyService,
+                catalogService,
+                failureManager,
+                executorService,
+                replicaManager
+        ) {
+            @Override
+            protected TxStateStorage createTxStateStorage(int zoneId, int partitionCount) {
+                TxStateStorage txStateStorage = new TxStateRocksDbStorage(zoneId, partitionCount, sharedTxStateStorage) {
+                    @Override
+                    public TxStateRocksDbPartitionStorage createPartitionStorage(int partitionId) {
+                        return txStatePartitionStorage;
+                    }
+                };
+
+                if (ThreadAssertions.enabled()) {
+                    txStateStorage = new ThreadAssertingTxStateStorage(txStateStorage);
+                }
+
+                txStateStorage.start();
+
+                return txStateStorage;
+            }
+        });
 
         partitionReplicaLifecycleManager = new PartitionReplicaLifecycleManager(
                 catalogManager,

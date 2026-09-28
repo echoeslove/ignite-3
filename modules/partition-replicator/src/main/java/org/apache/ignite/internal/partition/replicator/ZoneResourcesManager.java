@@ -29,10 +29,12 @@ import org.apache.ignite.internal.close.ManuallyCloseable;
 import org.apache.ignite.internal.failure.FailureProcessor;
 import org.apache.ignite.internal.network.TopologyService;
 import org.apache.ignite.internal.partition.replicator.raft.ZonePartitionRaftListener;
+import org.apache.ignite.internal.partition.replicator.raft.snapshot.LogStorageAccessImpl;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.PartitionSnapshotStorage;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.PartitionTxStateAccessImpl;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.ZonePartitionKey;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.outgoing.OutgoingSnapshotsManager;
+import org.apache.ignite.internal.replicator.ReplicaManager;
 import org.apache.ignite.internal.replicator.ZonePartitionId;
 import org.apache.ignite.internal.tx.TxManager;
 import org.apache.ignite.internal.tx.storage.state.ThreadAssertingTxStateStorage;
@@ -65,6 +67,8 @@ public class ZoneResourcesManager implements ManuallyCloseable {
 
     private final Executor partitionOperationsExecutor;
 
+    private final ReplicaManager replicaManager;
+
     /** Map from zone IDs to their resource holders. */
     private final Map<Integer, ZoneResources> resourcesByZoneId = new ConcurrentHashMap<>();
 
@@ -77,7 +81,8 @@ public class ZoneResourcesManager implements ManuallyCloseable {
             TopologyService topologyService,
             CatalogService catalogService,
             FailureProcessor failureProcessor,
-            Executor partitionOperationsExecutor
+            Executor partitionOperationsExecutor,
+            ReplicaManager replicaManager
     ) {
         this.sharedTxStateStorage = sharedTxStateStorage;
         this.txManager = txManager;
@@ -86,6 +91,7 @@ public class ZoneResourcesManager implements ManuallyCloseable {
         this.catalogService = catalogService;
         this.failureProcessor = failureProcessor;
         this.partitionOperationsExecutor = partitionOperationsExecutor;
+        this.replicaManager = replicaManager;
     }
 
     ZonePartitionResources allocateZonePartitionResources(
@@ -119,7 +125,8 @@ public class ZoneResourcesManager implements ManuallyCloseable {
                 new PartitionTxStateAccessImpl(txStatePartitionStorage),
                 catalogService,
                 failureProcessor,
-                partitionOperationsExecutor
+                partitionOperationsExecutor,
+                new LogStorageAccessImpl(replicaManager)
         );
 
         var zonePartitionResources = new ZonePartitionResources(
@@ -279,6 +286,10 @@ public class ZoneResourcesManager implements ManuallyCloseable {
 
         public TxStatePartitionStorage txStatePartitionStorage() {
             return txStatePartitionStorage;
+        }
+
+        public boolean txStatePartitionStorageIsInRebalanceState() {
+            return txStatePartitionStorage.lastAppliedIndex() == TxStatePartitionStorage.REBALANCE_IN_PROGRESS;
         }
 
         public ZonePartitionRaftListener raftListener() {
