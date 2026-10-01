@@ -18,6 +18,7 @@
 package org.apache.ignite.internal.lowwatermark;
 
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import org.apache.ignite.internal.event.EventProducer;
 import org.apache.ignite.internal.hlc.HybridTimestamp;
@@ -50,6 +51,14 @@ public interface LowWatermark extends EventProducer<LowWatermarkEvent, LowWaterm
      * @param newLowWatermark Candidate for update.
      */
     void updateLowWatermark(HybridTimestamp newLowWatermark);
+
+    /**
+     * Updates the low watermark and waits for an equal or higher update to take effect.
+     *
+     * @param newLowWatermark Candidate for update.
+     * @return Future completed after the update and its listener notifications have completed.
+     */
+    CompletableFuture<Void> updateLowWatermarkAsync(HybridTimestamp newLowWatermark);
 
     /**
      * Locks the low watermark at the provided timestamp (prevents it from being updated to a value higher than the provided one).

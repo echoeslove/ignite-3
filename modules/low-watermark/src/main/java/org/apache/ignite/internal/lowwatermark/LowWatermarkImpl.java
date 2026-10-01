@@ -322,8 +322,16 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
         updateLowWatermarkAsync(newLowWatermark);
     }
 
-    CompletableFuture<Void> updateLowWatermarkAsync(HybridTimestamp newLowWatermark) {
+    @Override
+    public CompletableFuture<Void> updateLowWatermarkAsync(HybridTimestamp newLowWatermark) {
         return inBusyLockAsync(busyLock, () -> {
+            HybridTimestamp currentLowWatermark = lowWatermark;
+
+            if (currentLowWatermark != null && currentLowWatermark.compareTo(newLowWatermark) >= 0) {
+                // Recovery may have restored a higher watermark before any candidate has been scheduled.
+                return lowWatermarkCandidate.get().updateFuture().copy();
+            }
+
             LowWatermarkCandidate newLowWatermarkCandidate = new LowWatermarkCandidate(newLowWatermark, new CompletableFuture<>());
             LowWatermarkCandidate oldLowWatermarkCandidate;
 
@@ -332,12 +340,12 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
 
                 // If another candidate contains a higher low watermark, then there is no need to update.
                 if (oldLowWatermarkCandidate.lowWatermark().compareTo(newLowWatermark) >= 0) {
-                    return nullCompletedFuture();
+                    return oldLowWatermarkCandidate.updateFuture().copy();
                 }
             } while (!lowWatermarkCandidate.compareAndSet(oldLowWatermarkCandidate, newLowWatermarkCandidate));
 
             // We will start the update as soon as the previous one finishes.
-            return oldLowWatermarkCandidate.updateFuture()
+            oldLowWatermarkCandidate.updateFuture()
                     .thenComposeAsync(unused -> updateAndNotify(newLowWatermark), scheduledThreadPool)
                     .whenComplete((unused, throwable) -> {
                         if (throwable != null) {
@@ -346,6 +354,8 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
                             newLowWatermarkCandidate.updateFuture().complete(null);
                         }
                     });
+
+            return newLowWatermarkCandidate.updateFuture().copy();
         });
     }
 

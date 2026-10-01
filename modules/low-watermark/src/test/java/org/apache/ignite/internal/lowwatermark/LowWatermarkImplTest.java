@@ -35,6 +35,7 @@ import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -52,6 +53,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -308,6 +310,69 @@ public class LowWatermarkImplTest extends BaseIgniteAbstractTest {
         lowWatermark.updateLowWatermark(newLwm1);
 
         assertThat(updateLowWatermarkFuture2, willTimeoutFast());
+    }
+
+    @Test
+    void cancellingInitialUpdateWaitDoesNotCancelSharedUpdate() {
+        assertThat(lowWatermark.startAsync(new ComponentContext()), willCompleteSuccessfully());
+        UUID lockId = UUID.randomUUID();
+        assertTrue(lowWatermark.tryLock(lockId, clockService.now()));
+        HybridTimestamp watermark = clockService.now();
+        CompletableFuture<Void> initialWait = lowWatermark.updateLowWatermarkAsync(watermark);
+        initialWait.cancel(false);
+        CompletableFuture<Void> repeatedWait = lowWatermark.updateLowWatermarkAsync(watermark);
+
+        try {
+            assertThat(repeatedWait, willTimeoutFast());
+        } finally {
+            lowWatermark.unlock(lockId);
+        }
+
+        assertThat(repeatedWait, willCompleteSuccessfully());
+        assertEquals(watermark, lowWatermark.getLowWatermark());
+    }
+
+    @Test
+    void updateDoesNotLowerWatermarkRestoredFromVault() {
+        HybridTimestamp restoredWatermark = clockService.now();
+        when(vaultManager.get(LOW_WATERMARK_VAULT_KEY))
+                .thenReturn(new VaultEntry(LOW_WATERMARK_VAULT_KEY, restoredWatermark.toBytes()));
+        assertThat(lowWatermark.startAsync(new ComponentContext()), willCompleteSuccessfully());
+
+        assertThat(lowWatermark.updateLowWatermarkAsync(restoredWatermark), willCompleteSuccessfully());
+        assertThat(lowWatermark.updateLowWatermarkAsync(restoredWatermark.subtractPhysicalTime(1)), willCompleteSuccessfully());
+        assertEquals(restoredWatermark, lowWatermark.getLowWatermark());
+        verify(failureManager, never()).process(any());
+    }
+
+    @Test
+    void repeatedUpdateWaitsForPendingHigherCandidate() {
+        assertThat(lowWatermark.startAsync(new ComponentContext()), willCompleteSuccessfully());
+
+        UUID lockId = UUID.randomUUID();
+        HybridTimestamp lockTimestamp = clockService.now();
+        assertTrue(lowWatermark.tryLock(lockId, lockTimestamp));
+
+        HybridTimestamp higherWatermark = clockService.now();
+        CompletableFuture<Void> higherUpdate = lowWatermark.updateLowWatermarkAsync(higherWatermark);
+        CompletableFuture<Void> repeatedUpdate = lowWatermark.updateLowWatermarkAsync(higherWatermark);
+        CompletableFuture<Void> lowerUpdate = lowWatermark.updateLowWatermarkAsync(lockTimestamp);
+        CompletableFuture<Void> cancelledWait = lowWatermark.updateLowWatermarkAsync(higherWatermark);
+        cancelledWait.cancel(false);
+
+        try {
+            assertFalse(higherUpdate.isDone(), "Cancelling a repeated wait must not cancel the shared update");
+            assertThat(higherUpdate, willTimeoutFast());
+            assertThat(repeatedUpdate, willTimeoutFast());
+            assertThat(lowerUpdate, willTimeoutFast());
+        } finally {
+            lowWatermark.unlock(lockId);
+        }
+
+        assertThat(higherUpdate, willCompleteSuccessfully());
+        assertThat(repeatedUpdate, willCompleteSuccessfully());
+        assertThat(lowerUpdate, willCompleteSuccessfully());
+        assertEquals(higherWatermark, lowWatermark.getLowWatermark());
     }
 
     @Test

@@ -29,6 +29,8 @@ import static org.apache.ignite.internal.util.CompletableFutures.emptySetComplet
 import static org.apache.ignite.internal.util.CompletableFutures.falseCompletedFuture;
 import static org.apache.ignite.internal.util.CompletableFutures.nullCompletedFuture;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -212,6 +214,10 @@ public class ReplicaManagerTest extends BaseIgniteAbstractTest {
 
         assertThat(startReplicaFuture, willCompleteSuccessfully());
 
+        assertFalse(replicaManager.isLocalReplicaHealthyForRead(groupId));
+        when(raftManager.isLocalRaftNodeHealthyForRead(any(RaftNodeId.class))).thenReturn(true);
+        assertTrue(replicaManager.isLocalReplicaHealthyForRead(groupId));
+
         var expectedCreateParams = new LocalReplicaEventParameters(groupId);
 
         verify(createReplicaListener).notify(eq(expectedCreateParams));
@@ -220,6 +226,8 @@ public class ReplicaManagerTest extends BaseIgniteAbstractTest {
         CompletableFuture<Boolean> stopReplicaFuture = replicaManager.stopReplica(groupId);
 
         assertThat(stopReplicaFuture, willBe(true));
+
+        assertFalse(replicaManager.isLocalReplicaHealthyForRead(groupId));
 
         verify(createReplicaListener).notify(eq(expectedCreateParams));
         verify(removeReplicaListener).notify(eq(expectedCreateParams));

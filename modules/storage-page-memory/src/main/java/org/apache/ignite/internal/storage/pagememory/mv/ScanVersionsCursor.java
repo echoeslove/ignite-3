@@ -106,7 +106,7 @@ class ScanVersionsCursor implements Cursor<ReadResult> {
 
         if (rowVersion.isCommitted()) {
             if (rowVersion.isTombstone()) {
-                return ReadResult.empty(rowId);
+                return ReadResult.createFromCommitted(rowId, null, rowVersion.timestamp());
             } else {
                 return ReadResult.createFromCommitted(rowId, rowVersion.value(), rowVersion.timestamp());
             }

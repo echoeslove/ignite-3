@@ -1599,6 +1599,36 @@ public abstract class AbstractMvPartitionStorageTest extends BaseMvPartitionStor
         });
     }
 
+    @Test
+    public void scanVersionsRetainsCommitTimestampForCommittedTombstone() {
+        RowId rowId = new RowId(PARTITION_ID);
+        HybridTimestamp valueTimestamp = clock.now();
+        HybridTimestamp tombstoneTimestamp = clock.now();
+
+        addWriteCommitted(rowId, binaryRow, valueTimestamp);
+        addWriteCommitted(rowId, null, tombstoneTimestamp);
+
+        storage.runConsistently(locker -> {
+            locker.lock(rowId);
+
+            try (Cursor<ReadResult> cursor = storage.scanVersions(rowId)) {
+                ReadResult tombstone = cursor.next();
+
+                assertTrue(tombstone.isEmpty());
+                assertFalse(tombstone.isWriteIntent());
+                assertThat(tombstone.commitTimestamp(), is(tombstoneTimestamp));
+
+                ReadResult previousValue = cursor.next();
+
+                assertThat(previousValue.binaryRow(), isRow(binaryRow));
+                assertThat(previousValue.commitTimestamp(), is(valueTimestamp));
+                assertFalse(cursor.hasNext());
+            }
+
+            return null;
+        });
+    }
+
     @ParameterizedTest
     @EnumSource(ScanTimestampProvider.class)
     public void scanCursorHasNextReturnsFalseEachTimeAfterExhaustion(ScanTimestampProvider tsProvider) {

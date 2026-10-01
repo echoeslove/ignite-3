@@ -38,6 +38,16 @@ import org.jetbrains.annotations.Nullable;
  */
 public interface RaftManager extends IgniteComponent {
     /**
+     * Returns whether a local Raft node is active, initialized, and not installing a snapshot.
+     *
+     * <p>This is a point-in-time check; callers must still handle a concurrent state change.
+     *
+     * @param nodeId Local Raft node identifier.
+     * @return {@code true} if the local Raft node is currently eligible to serve reads.
+     */
+    boolean isLocalRaftNodeHealthyForRead(RaftNodeId nodeId);
+
+    /**
      * Starts a Raft group and a Raft service on the current node, using the given service factory.
      *
      * <p>Does not wait for the Raft log to be applied.

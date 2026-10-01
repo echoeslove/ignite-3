@@ -257,8 +257,8 @@ public class PartitionMvStorageAccessImpl implements PartitionMvStorageAccess {
     }
 
     @Override
-    public void updateLowWatermark(HybridTimestamp newLowWatermark) {
-        lowWatermark.updateLowWatermark(newLowWatermark);
+    public CompletableFuture<Void> updateLowWatermark(HybridTimestamp newLowWatermark) {
+        return lowWatermark.updateLowWatermarkAsync(newLowWatermark);
     }
 
     @Override

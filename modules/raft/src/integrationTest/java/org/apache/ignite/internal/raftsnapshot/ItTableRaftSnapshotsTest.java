@@ -31,6 +31,7 @@ import static org.apache.ignite.internal.testframework.IgniteTestUtils.getFieldV
 import static org.apache.ignite.internal.testframework.IgniteTestUtils.waitForCondition;
 import static org.apache.ignite.internal.testframework.matchers.CompletableFutureMatcher.willCompleteSuccessfully;
 import static org.apache.ignite.internal.testframework.matchers.CompletableFutureMatcher.willSucceedIn;
+import static org.apache.ignite.lang.ErrorGroups.Transactions.TX_READ_ONLY_TOO_OLD_ERR;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.everyItem;
@@ -39,6 +40,8 @@ import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
@@ -52,8 +55,10 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.apache.ignite.Ignite;
@@ -61,14 +66,19 @@ import org.apache.ignite.internal.Cluster;
 import org.apache.ignite.internal.ClusterPerTestIntegrationTest;
 import org.apache.ignite.internal.app.IgniteImpl;
 import org.apache.ignite.internal.cluster.management.CmgGroupId;
+import org.apache.ignite.internal.hlc.HybridTimestamp;
+import org.apache.ignite.internal.lang.IgniteInternalException;
 import org.apache.ignite.internal.logger.IgniteLogger;
 import org.apache.ignite.internal.logger.Loggers;
+import org.apache.ignite.internal.lowwatermark.message.GetLowWatermarkResponse;
 import org.apache.ignite.internal.metastorage.server.WatchListenerInhibitor;
 import org.apache.ignite.internal.metastorage.server.raft.MetastorageGroupId;
 import org.apache.ignite.internal.network.NetworkMessage;
 import org.apache.ignite.internal.network.serialization.MessageSerializationRegistry;
 import org.apache.ignite.internal.partition.replicator.network.raft.SnapshotMetaResponse;
 import org.apache.ignite.internal.partition.replicator.network.raft.SnapshotMvDataResponse;
+import org.apache.ignite.internal.partition.replicator.network.replication.ReadOnlyMultiRowPkReplicaRequest;
+import org.apache.ignite.internal.partition.replicator.network.replication.ReadOnlySingleRowPkReplicaRequest;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.incoming.IncomingSnapshotCopier;
 import org.apache.ignite.internal.placementdriver.ReplicaMeta;
 import org.apache.ignite.internal.raft.server.RaftServer;
@@ -78,12 +88,17 @@ import org.apache.ignite.internal.replicator.command.SafeTimeSyncCommand;
 import org.apache.ignite.internal.storage.MvPartitionStorage;
 import org.apache.ignite.internal.storage.pagememory.PersistentPageMemoryStorageEngine;
 import org.apache.ignite.internal.storage.pagememory.VolatilePageMemoryStorageEngine;
+import org.apache.ignite.internal.storage.pagememory.mv.AbstractPageMemoryMvPartitionStorage;
 import org.apache.ignite.internal.storage.rocksdb.RocksDbStorageEngine;
 import org.apache.ignite.internal.table.InternalTable;
 import org.apache.ignite.internal.table.distributed.schema.PartitionCommandsMarshallerImpl;
+import org.apache.ignite.internal.table.distributed.storage.InternalTableImpl;
 import org.apache.ignite.internal.testframework.IgniteTestUtils;
 import org.apache.ignite.internal.testframework.log4j2.LogInspector;
 import org.apache.ignite.internal.testframework.log4j2.LogInspector.Handler;
+import org.apache.ignite.internal.tx.InternalTransaction;
+import org.apache.ignite.internal.tx.InternalTxOptions;
+import org.apache.ignite.internal.wrapper.Wrapper;
 import org.apache.ignite.raft.jraft.RaftGroupService;
 import org.apache.ignite.raft.jraft.RaftMessagesFactory;
 import org.apache.ignite.raft.jraft.Status;
@@ -96,6 +111,7 @@ import org.apache.ignite.raft.jraft.rpc.RpcProcessor;
 import org.apache.ignite.raft.jraft.rpc.RpcRequestClosure;
 import org.apache.ignite.raft.jraft.rpc.RpcRequestProcessor;
 import org.apache.ignite.raft.jraft.rpc.RpcRequests.AppendEntriesRequest;
+import org.apache.ignite.raft.jraft.rpc.RpcRequests.InstallSnapshotRequest;
 import org.apache.ignite.raft.jraft.rpc.RpcServer;
 import org.apache.ignite.raft.jraft.rpc.WriteActionRequest;
 import org.apache.ignite.raft.jraft.rpc.impl.IgniteRpcServer;
@@ -105,12 +121,14 @@ import org.apache.ignite.table.KeyValueView;
 import org.apache.ignite.table.Table;
 import org.apache.ignite.table.Tuple;
 import org.apache.ignite.tx.Transaction;
+import org.apache.ignite.tx.TransactionOptions;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
@@ -130,6 +148,8 @@ class ItTableRaftSnapshotsTest extends ClusterPerTestIntegrationTest {
 
     private static final String TEST_TABLE_NAME = "test";
 
+    private static final boolean LONG_SNAPSHOT_TIMEOUT_TEST = "true".equals(System.getenv("IGNITE_HF4_LONG_SNAPSHOT_TIMEOUT_TEST"));
+
     /**
      * Nodes bootstrap configuration pattern.
      *
@@ -141,7 +161,7 @@ class ItTableRaftSnapshotsTest extends ClusterPerTestIntegrationTest {
             + "    port: {},\n"
             + "    nodeFinder.netClusterNodes: [ {} ]\n"
             + "  },\n"
-            + "  raft.installSnapshotTimeoutMillis: 10000,\n"
+            + "  raft.installSnapshotTimeoutMillis: " + (LONG_SNAPSHOT_TIMEOUT_TEST ? 660000 : 10000) + ",\n"
             + "  storage.profiles: {"
             + "        " + DEFAULT_AIPERSIST_PROFILE_NAME + ".engine: aipersist, "
             + "        " + DEFAULT_AIMEM_PROFILE_NAME + ".engine: aimem, "
@@ -220,6 +240,705 @@ class ItTableRaftSnapshotsTest extends ClusterPerTestIntegrationTest {
                 PersistentPageMemoryStorageEngine.ENGINE_NAME,
                 VolatilePageMemoryStorageEngine.ENGINE_NAME
         );
+    }
+
+    /** Tests that a persistent PageMemory tombstone can be transferred in a RAFT snapshot. */
+    @Test
+    @Timeout(180)
+    void installsSnapshotContainingCommittedTombstone() throws Exception {
+        createTestTableWith3Replicas(PersistentPageMemoryStorageEngine.ENGINE_NAME);
+        transferLeadershipOnSolePartitionTo(0);
+        knockoutNode(2);
+
+        putToNode(0, 1, "one");
+        putToNode(0, 2, "two");
+        assertTrue(tableViewAt(0).remove(null, 1));
+
+        causeLogTruncationOnSolePartitionLeader(0);
+        reanimateNode2AndWaitForSnapshotInstalled();
+
+        transferLeadershipOnSolePartitionTo(2);
+        assertNull(getFromNode(2, 1));
+        assertEquals("two", getFromNode(2, 2));
+    }
+
+    /** Verifies that a permanently unanswered metadata RPC times out and a later snapshot with a tombstone succeeds. */
+    @Test
+    @EnabledIfEnvironmentVariable(named = "IGNITE_HF4_LONG_SNAPSHOT_TIMEOUT_TEST", matches = "true")
+    @Timeout(value = 6, unit = TimeUnit.MINUTES)
+    void committedTombstoneSnapshotRecoversAfterUnansweredMetadataRequest() throws Exception {
+        createTestTableWith3Replicas(PersistentPageMemoryStorageEngine.ENGINE_NAME);
+        transferLeadershipOnSolePartitionTo(0);
+        transferPrimaryOnSolePartitionTo(0);
+        knockoutNode(2);
+
+        putToNode(0, 1, "one");
+        putToNode(0, 2, "two");
+        assertTrue(tableViewAt(0).remove(null, 1));
+        causeLogTruncationOnSolePartitionLeader(0);
+
+        CompletableFuture<Void> firstMetadataResponse = new CompletableFuture<>();
+        CompletableFuture<Void> copierTimeout = new CompletableFuture<>();
+        CompletableFuture<Void> failedInstall = new CompletableFuture<>();
+        CompletableFuture<Void> successfulInstall = new CompletableFuture<>();
+
+        copierLogInspector.addHandler(
+                event -> event.getMessage().getFormattedMessage().startsWith("Snapshot request timed out while completing copier"),
+                () -> copierTimeout.complete(null)
+        );
+        replicatorLogInspector.addHandler(
+                event -> copierTimeout.isDone()
+                        && event.getMessage().getFormattedMessage().startsWith("Node 20_part_0:")
+                        && event.getMessage().getFormattedMessage().contains(
+                                " received InstallSnapshotResponse from " + cluster.nodeName(2) + " ")
+                        && event.getMessage().getFormattedMessage().contains("Unknown error on completion the copier"),
+                () -> failedInstall.complete(null)
+        );
+        listenForSnapshotInstalledSuccessFromLogger(0, 2, successfulInstall);
+
+        BiPredicate<String, NetworkMessage> dropMetadataResponse = dropSnapshotMetaResponse(firstMetadataResponse);
+        unwrapIgniteImpl(cluster.node(0)).dropMessages(
+                (targetNode, message) -> !failedInstall.isDone() && dropMetadataResponse.test(targetNode, message)
+        );
+        reanimateNode(2);
+
+        assertThat(firstMetadataResponse, willSucceedIn(1, TimeUnit.MINUTES));
+        ReplicationGroupId groupId = cluster.solePartitionId(TEST_ZONE_NAME, TEST_TABLE_NAME);
+        IgniteImpl node2 = unwrapIgniteImpl(cluster.node(2));
+        AtomicInteger localReads = new AtomicInteger();
+        AtomicInteger remoteReads = new AtomicInteger();
+
+        node2.dropMessages((recipient, message) -> {
+            if (message instanceof ReadOnlySingleRowPkReplicaRequest || message instanceof ReadOnlyMultiRowPkReplicaRequest) {
+                (node2.name().equals(recipient) ? localReads : remoteReads).incrementAndGet();
+            }
+
+            return false;
+        });
+
+        try {
+            for (int sample = 0; sample < 4; sample++) {
+                if (sample != 0) {
+                    TimeUnit.SECONDS.sleep(15);
+                }
+
+                assertFalse(copierTimeout.isDone(), "Samples must be taken before the first copier times out");
+                assertTrue(waitForCondition(() -> snapshotInstallingOnNode2(groupId), 30_000));
+                assertTrue(node2.replicaManager().isReplicaReady(groupId));
+                assertFalse(node2.replicaManager().isLocalReplicaHealthyForRead(groupId));
+                assertReadOnlyDataFromNode2();
+                assertEquals(0, localReads.get(), "A replica installing a snapshot must not receive local KV reads");
+                assertEquals(2 * (sample + 1), remoteReads.get());
+                LOG.info("HF4_SNAPSHOT_RO_SAMPLE sample={} installing=true replicaReady=true healthyForRead=false "
+                                + "localReads={} remoteReads={}",
+                        sample, localReads.get(), remoteReads.get());
+            }
+
+            assertThat(copierTimeout, willSucceedIn(3, TimeUnit.MINUTES));
+            assertThat(failedInstall, willSucceedIn(1, TimeUnit.MINUTES));
+
+            unwrapIgniteImpl(cluster.node(0)).stopDroppingMessages();
+            assertThat(successfulInstall, willSucceedIn(1, TimeUnit.MINUTES));
+            assertTrue(waitForCondition(() -> node2.replicaManager().isLocalReplicaHealthyForRead(groupId), 30_000));
+            assertReadOnlyDataFromNode2();
+            assertEquals(2, localReads.get(), "Recovered replica should serve local KV reads again");
+            assertEquals(8, remoteReads.get());
+            LOG.info("HF4_SNAPSHOT_RO_RECOVERED installing=false healthyForRead=true localReads={} remoteReads={}",
+                    localReads.get(), remoteReads.get());
+        } finally {
+            node2.stopDroppingMessages();
+            unwrapIgniteImpl(cluster.node(0)).stopDroppingMessages();
+        }
+
+        transferLeadershipOnSolePartitionTo(2);
+        assertNull(getFromNode(2, 1));
+        assertEquals("two", getFromNode(2, 2));
+    }
+
+    /** Observes local read routing after a failed snapshot has aborted the MV rebalance. */
+    @Test
+    @EnabledIfEnvironmentVariable(named = "IGNITE_HF4_FAILED_SNAPSHOT_WINDOW_TEST", matches = "true")
+    @Timeout(value = 17, unit = TimeUnit.MINUTES)
+    void failedSnapshotAbortWindowLocalReadProbe() throws Exception {
+        createTestTableWith3Replicas(PersistentPageMemoryStorageEngine.ENGINE_NAME);
+        pauseForSnapshotProbe("table-created");
+        transferLeadershipOnSolePartitionTo(0);
+        pauseForSnapshotProbe("leader-transferred");
+        transferPrimaryOnSolePartitionTo(0);
+        pauseForSnapshotProbe("primary-transferred");
+
+        putToNode(0, 1, "one");
+        pauseForSnapshotProbe("first-write");
+        putToNode(0, 2, "two");
+        pauseForSnapshotProbe("second-write");
+
+        knockoutNode(2);
+        pauseForSnapshotProbe("node2-stopped");
+        putToNode(0, 3, "three");
+        pauseForSnapshotProbe("third-write");
+        causeLogTruncationOnSolePartitionLeader(0);
+        pauseForSnapshotProbe("leader-log-truncated");
+
+        CompletableFuture<Void> firstMvResponse = new CompletableFuture<>();
+        CompletableFuture<Void> copierTimeout = new CompletableFuture<>();
+        CompletableFuture<Void> copierCanceled = new CompletableFuture<>();
+        CompletableFuture<Void> failedInstall = new CompletableFuture<>();
+        CompletableFuture<Void> successfulInstall = new CompletableFuture<>();
+        AtomicInteger installRequests = new AtomicInteger();
+        AtomicInteger droppedMvResponses = new AtomicInteger();
+        AtomicInteger localReads = new AtomicInteger();
+        AtomicInteger remoteReads = new AtomicInteger();
+        AtomicBoolean releaseFault = new AtomicBoolean();
+
+        copierLogInspector.addHandler(
+                event -> event.getMessage().getFormattedMessage().startsWith("Snapshot request timed out while completing copier"),
+                () -> copierTimeout.complete(null)
+        );
+        copierLogInspector.addHandler(
+                event -> event.getMessage().getFormattedMessage().startsWith("Copier is canceled for partition"),
+                () -> copierCanceled.complete(null)
+        );
+        replicatorLogInspector.addHandler(
+                event -> (copierTimeout.isDone() || copierCanceled.isDone())
+                        && event.getMessage().getFormattedMessage().contains(
+                                " received InstallSnapshotResponse from " + cluster.nodeName(2) + " ")
+                        && (event.getMessage().getFormattedMessage().contains("error:Status[UNKNOWN")
+                                || event.getMessage().getFormattedMessage().contains("error:Status[ECANCELED")),
+                () -> failedInstall.complete(null)
+        );
+        listenForSnapshotInstalledSuccessFromLogger(0, 2, successfulInstall);
+
+        String node2Name = cluster.nodeName(2);
+        IgniteImpl node0 = unwrapIgniteImpl(cluster.node(0));
+
+        node0.dropMessages((recipient, message) -> {
+            if (!node2Name.equals(recipient)) {
+                return false;
+            }
+
+            if (message instanceof InstallSnapshotRequest) {
+                installRequests.incrementAndGet();
+                return firstMvResponse.isDone() && !releaseFault.get();
+            }
+
+            if (message instanceof SnapshotMvDataResponse && !releaseFault.get()) {
+                droppedMvResponses.incrementAndGet();
+                firstMvResponse.complete(null);
+                return true;
+            }
+
+            return false;
+        });
+
+        try {
+            reanimateNode(2);
+            pauseForSnapshotProbe("node2-restarted");
+            assertThat(firstMvResponse, willSucceedIn(1, TimeUnit.MINUTES));
+            assertTrue(installRequests.get() > 0, "InstallSnapshotRequest was not observed by the fault injector");
+
+            IgniteImpl node2 = unwrapIgniteImpl(cluster.node(2));
+            ReplicationGroupId groupId = cluster.solePartitionId(TEST_ZONE_NAME, TEST_TABLE_NAME);
+
+            node2.dropMessages((recipient, message) -> {
+                if (message instanceof ReadOnlySingleRowPkReplicaRequest || message instanceof ReadOnlyMultiRowPkReplicaRequest) {
+                    (node2.name().equals(recipient) ? localReads : remoteReads).incrementAndGet();
+                }
+
+                return false;
+            });
+
+            try {
+                assertTrue(waitForCondition(() -> snapshotInstallingOnNode2(groupId), 30_000));
+                LOG.info("HF4_ABORT_PROBE phase=installing healthy={} lastApplied={} safeTime={}",
+                        node2.replicaManager().isLocalReplicaHealthyForRead(groupId),
+                        mvPartitionAtNode(2).lastAppliedIndex(),
+                        unwrapTableImpl(tableAt(2)).internalTable().getPartitionSafeTimeTracker(PARTITION_ID).current());
+
+                assertThat(CompletableFuture.anyOf(copierTimeout, copierCanceled), willSucceedIn(11, TimeUnit.MINUTES));
+                assertThat(failedInstall, willSucceedIn(1, TimeUnit.MINUTES));
+                pauseForSnapshotProbe("failed-install-cleared");
+
+                LOG.info("HF4_ABORT_PROBE phase=failure-trigger cause={}",
+                        copierTimeout.isDone() ? "MV_RPC_TIMEOUT" : "RAFT_CANCEL");
+
+                for (int sample = 0; sample < 3; sample++) {
+                    boolean installing = snapshotInstallingOnNode2(groupId);
+                    boolean healthy = node2.replicaManager().isLocalReplicaHealthyForRead(groupId);
+                    long lastApplied = mvPartitionAtNode(2).lastAppliedIndex();
+                    String getOutcome = probeReadOnlyGetAtNode2(2);
+
+                    assertFalse(installing);
+                    assertEquals(0, lastApplied);
+                    assertEquals("two", getOutcome);
+                    assertEquals(0, localReads.get());
+                    assertEquals(sample + 1, remoteReads.get());
+
+                    LOG.info("HF4_ABORT_PROBE phase=after-failure sample={} installing={} healthy={} lastApplied={} "
+                                    + "safeTime={} getOutcome={} localReads={} remoteReads={} installRequests={} droppedMvResponses={}",
+                            sample, installing, healthy, lastApplied,
+                            unwrapTableImpl(tableAt(2)).internalTable().getPartitionSafeTimeTracker(PARTITION_ID).current(),
+                            getOutcome, localReads.get(), remoteReads.get(), installRequests.get(), droppedMvResponses.get());
+                    pauseForSnapshotProbe("after-failure-sample-" + sample);
+                }
+            } finally {
+                node2.stopDroppingMessages();
+            }
+        } finally {
+            releaseFault.set(true);
+            node0.stopDroppingMessages();
+        }
+
+        pauseForSnapshotProbe("fault-released");
+        assertThat(successfulInstall, willSucceedIn(2, TimeUnit.MINUTES));
+        pauseForSnapshotProbe("recovered");
+        assertEquals("two", getFromNode(2, 2));
+        assertEquals("three", getFromNode(2, 3));
+        LOG.info("HF4_ABORT_PROBE phase=recovered result=PASS");
+    }
+
+    private static void pauseForSnapshotProbe(String stage) throws InterruptedException {
+        LOG.info("HF4_ABORT_PROBE phase={} pauseSeconds=5", stage);
+        TimeUnit.SECONDS.sleep(5);
+    }
+
+    private String probeReadOnlyGetAtNode2(int key) {
+        return probeReadOnlyGetAtNode2(key, 5_000);
+    }
+
+    private String probeReadOnlyGetAtNode2(int key, long timeoutMillis) {
+        Transaction tx = cluster.node(2).transactions().begin(new TransactionOptions().readOnly(true).timeoutMillis(timeoutMillis));
+
+        try {
+            return String.valueOf(tableViewAt(2).get(tx, key));
+        } catch (RuntimeException e) {
+            return "ERROR:" + e.getClass().getSimpleName() + ":" + e.getMessage();
+        } finally {
+            tx.rollback();
+        }
+    }
+
+    /** Verifies that MV rebalance remains incomplete until the sender's low-watermark response arrives. */
+    @Test
+    @EnabledIfEnvironmentVariable(named = "IGNITE_HF4_LWM_RESPONSE_PROBE", matches = "true")
+    @Timeout(value = 6, unit = TimeUnit.MINUTES)
+    void lowWatermarkResponseTimeoutProbe() throws Exception {
+        createTestTableWith3Replicas(PersistentPageMemoryStorageEngine.ENGINE_NAME);
+        pauseForSnapshotProbe("lwm-table-created");
+        transferLeadershipOnSolePartitionTo(0);
+        pauseForSnapshotProbe("lwm-leader-transferred");
+        transferPrimaryOnSolePartitionTo(0);
+        pauseForSnapshotProbe("lwm-primary-transferred");
+
+        putToNode(0, 1, "one");
+        pauseForSnapshotProbe("lwm-first-write");
+        putToNode(0, 2, "two");
+        pauseForSnapshotProbe("lwm-second-write");
+        assertTrue(tableViewAt(0).remove(null, 1));
+        pauseForSnapshotProbe("lwm-first-row-deleted");
+        knockoutNode(2);
+        pauseForSnapshotProbe("lwm-node2-stopped");
+        putToNode(0, 3, "three");
+        pauseForSnapshotProbe("lwm-third-write");
+        causeLogTruncationOnSolePartitionLeader(0);
+        pauseForSnapshotProbe("lwm-leader-log-truncated");
+
+        CompletableFuture<Void> firstLowWatermarkResponse = new CompletableFuture<>();
+        CompletableFuture<Void> successfulInstall = new CompletableFuture<>();
+        AtomicInteger localReads = new AtomicInteger();
+        AtomicInteger remoteReads = new AtomicInteger();
+        AtomicInteger droppedResponses = new AtomicInteger();
+        listenForSnapshotInstalledSuccessFromLogger(0, 2, successfulInstall);
+
+        IgniteImpl node0 = unwrapIgniteImpl(cluster.node(0));
+        String node2Name = cluster.nodeName(2);
+
+        node0.dropMessages((recipient, message) -> {
+            if (node2Name.equals(recipient) && message instanceof GetLowWatermarkResponse) {
+                droppedResponses.incrementAndGet();
+                firstLowWatermarkResponse.complete(null);
+                return true;
+            }
+
+            return false;
+        });
+
+        try {
+            reanimateNode(2);
+            pauseForSnapshotProbe("lwm-node2-restarted");
+            assertThat(firstLowWatermarkResponse, willSucceedIn(1, TimeUnit.MINUTES));
+
+            IgniteImpl node2 = unwrapIgniteImpl(cluster.node(2));
+            ReplicationGroupId groupId = cluster.solePartitionId(TEST_ZONE_NAME, TEST_TABLE_NAME);
+
+            node2.dropMessages((recipient, message) -> {
+                if (message instanceof ReadOnlySingleRowPkReplicaRequest || message instanceof ReadOnlyMultiRowPkReplicaRequest) {
+                    (node2.name().equals(recipient) ? localReads : remoteReads).incrementAndGet();
+                }
+
+                return false;
+            });
+
+            try {
+                assertTrue(snapshotInstallingOnNode2(groupId));
+                assertFalse(node2.replicaManager().isLocalReplicaHealthyForRead(groupId));
+                assertTrue(mvPartitionAtNode(2).lastAppliedIndex() < 0, "MV rebalance must remain incomplete");
+                assertReadOnlyDataFromNode2();
+                LOG.info("HF4_LWM_PROBE phase=waiting installing={} healthy={} lastApplied={} localReads={} remoteReads={} "
+                                + "droppedResponses={}",
+                        snapshotInstallingOnNode2(groupId), node2.replicaManager().isLocalReplicaHealthyForRead(groupId),
+                        mvPartitionAtNode(2).lastAppliedIndex(), localReads.get(), remoteReads.get(), droppedResponses.get());
+                pauseForSnapshotProbe("lwm-waiting");
+
+                TimeUnit.SECONDS.sleep(5);
+                assertFalse(successfulInstall.isDone(), "A missing low watermark must not produce snapshot success");
+                node0.stopDroppingMessages();
+                assertThat(successfulInstall, willSucceedIn(3, TimeUnit.MINUTES));
+                pauseForSnapshotProbe("lwm-installed-after-retry");
+                assertTrue(waitForCondition(() -> node2.replicaManager().isLocalReplicaHealthyForRead(groupId), 30_000));
+                assertReadOnlyDataFromNode2();
+                assertEquals(2, localReads.get(), "Recovered replica should serve local KV reads");
+                assertEquals(2, remoteReads.get(), "Pending snapshot should route both KV reads remotely");
+                LOG.info("HF4_LWM_PROBE phase=recovered result=PASS installing={} healthy={} lastApplied={} "
+                                + "localReads={} remoteReads={} droppedResponses={}",
+                        snapshotInstallingOnNode2(groupId), node2.replicaManager().isLocalReplicaHealthyForRead(groupId),
+                        mvPartitionAtNode(2).lastAppliedIndex(), localReads.get(), remoteReads.get(), droppedResponses.get());
+            } finally {
+                node2.stopDroppingMessages();
+            }
+        } finally {
+            node0.stopDroppingMessages();
+        }
+    }
+
+    /** Verifies that missing low watermark aborts a snapshot and retry preserves the historical read boundary. */
+    @Test
+    @EnabledIfEnvironmentVariable(named = "IGNITE_HF4_STALE_LWM_PROBE", matches = "true")
+    @Timeout(value = 6, unit = TimeUnit.MINUTES)
+    void snapshotWithMissingLowWatermarkMustNotServeOldRead() throws Exception {
+        createTestTableWith3Replicas(PersistentPageMemoryStorageEngine.ENGINE_NAME);
+        transferLeadershipOnSolePartitionTo(0);
+        transferPrimaryOnSolePartitionTo(0);
+
+        putToNode(0, 1, "one");
+        putToNode(0, 2, "two");
+        IgniteImpl node0 = unwrapIgniteImpl(cluster.node(0));
+        HybridTimestamp oldReadTimestamp = node0.clockService().now();
+        assertEquals("one", readAtTimestamp(2, 1, oldReadTimestamp));
+
+        knockoutNode(2);
+        assertTrue(tableViewAt(0).remove(null, 1));
+        assertFalse(IgniteTestUtils.bypassingThreadAssertions(
+                () -> mvPartitionAtNode(0).peek(HybridTimestamp.MAX_VALUE, 1).isEmpty()));
+
+        node0.lowWatermark().updateLowWatermark(node0.clockService().now());
+        assertTrue(waitForCondition(() -> {
+            HybridTimestamp watermark = node0.lowWatermark().getLowWatermark();
+            return watermark != null && watermark.compareTo(oldReadTimestamp) > 0;
+        }, 30_000));
+        assertTrue(waitForCondition(() -> IgniteTestUtils.bypassingThreadAssertions(
+                () -> mvPartitionAtNode(0).peek(HybridTimestamp.MAX_VALUE, 1).isEmpty()), 60_000),
+                "The sender must actually GC the old row version before taking the snapshot");
+        IgniteInternalException senderRejection = assertThrows(IgniteInternalException.class,
+                () -> readAtTimestamp(0, 1, oldReadTimestamp));
+        assertEquals(TX_READ_ONLY_TOO_OLD_ERR, senderRejection.code());
+        causeLogTruncationOnSolePartitionLeader(0);
+
+        CompletableFuture<Void> lowWatermarkResponseDropped = new CompletableFuture<>();
+        CompletableFuture<Void> snapshotInstalled = new CompletableFuture<>();
+        CompletableFuture<Void> lowWatermarkTimedOut = new CompletableFuture<>();
+        CompletableFuture<Void> failedInstall = new CompletableFuture<>();
+        AtomicInteger localReads = new AtomicInteger();
+        AtomicInteger remoteReads = new AtomicInteger();
+        copierLogInspector.addHandler(
+                event -> event.getMessage().getFormattedMessage().startsWith("Snapshot request timed out; aborting rebalance"),
+                () -> lowWatermarkTimedOut.complete(null)
+        );
+        replicatorLogInspector.addHandler(
+                event -> lowWatermarkTimedOut.isDone()
+                        && event.getMessage().getFormattedMessage().startsWith("Node 20_part_0:")
+                        && event.getMessage().getFormattedMessage().contains(
+                                " received InstallSnapshotResponse from " + cluster.nodeName(2) + " ")
+                        && event.getMessage().getFormattedMessage().contains("error:"),
+                () -> failedInstall.complete(null)
+        );
+        listenForSnapshotInstalledSuccessFromLogger(0, 2, snapshotInstalled);
+        node0.dropMessages((recipient, message) -> {
+            if (cluster.nodeName(2).equals(recipient) && message instanceof GetLowWatermarkResponse) {
+                lowWatermarkResponseDropped.complete(null);
+                return true;
+            }
+
+            return false;
+        });
+
+        try {
+            reanimateNode(2);
+            assertThat(lowWatermarkResponseDropped, willSucceedIn(1, TimeUnit.MINUTES));
+
+            IgniteImpl node2 = unwrapIgniteImpl(cluster.node(2));
+            ReplicationGroupId groupId = cluster.solePartitionId(TEST_ZONE_NAME, TEST_TABLE_NAME);
+            InternalTransaction historicalTransaction = node2.txManager().beginExplicitRo(
+                    node2.observableTimeTracker(), InternalTxOptions.builder().readTimestamp(oldReadTimestamp).build());
+            node2.dropMessages((recipient, message) -> {
+                if (message instanceof ReadOnlySingleRowPkReplicaRequest || message instanceof ReadOnlyMultiRowPkReplicaRequest) {
+                    (node2.name().equals(recipient) ? localReads : remoteReads).incrementAndGet();
+                }
+
+                return false;
+            });
+
+            try {
+                assertTrue(snapshotInstallingOnNode2(groupId));
+                assertFalse(node2.replicaManager().isLocalReplicaHealthyForRead(groupId));
+                assertReadOnlyDataFromNode2();
+                assertEquals(0, localReads.get());
+                assertEquals(2, remoteReads.get());
+                assertThat(failedInstall, willSucceedIn(3, TimeUnit.MINUTES));
+                assertFalse(snapshotInstalled.isDone(), "Missing low watermark must not produce snapshot success");
+                assertTrue(waitForCondition(() -> mvPartitionAtNode(2).lastAppliedIndex() <= 0, 30_000),
+                        "Failed snapshot must be aborted or already retrying, never expose completed storage");
+                InternalTableImpl internalTable = (InternalTableImpl) unwrapTableImpl(tableAt(2)).internalTable();
+                Predicate<ReplicationGroupId> localReadiness = getFieldValue(internalTable, "localReplicaReady");
+                assertFalse(localReadiness.test(groupId), "Both Raft health and the MV storage guard must permit a local read");
+                LOG.info("HF4_LWM_FIX phase=failed installing={} healthy=false lastApplied={} localReads={} remoteReads={}",
+                        snapshotInstallingOnNode2(groupId), mvPartitionAtNode(2).lastAppliedIndex(), localReads.get(), remoteReads.get());
+
+                CompletableFuture<Void> retryLowWatermarkResponse = new CompletableFuture<>();
+                node0.dropMessages((recipient, message) -> {
+                    if (cluster.nodeName(2).equals(recipient) && message instanceof GetLowWatermarkResponse) {
+                        retryLowWatermarkResponse.complete(null);
+                    }
+
+                    return false;
+                });
+                assertThat(retryLowWatermarkResponse, willSucceedIn(1, TimeUnit.MINUTES));
+                AtomicReference<?> updateCandidate = getFieldValue(node2.lowWatermark(), "lowWatermarkCandidate");
+                assertTrue(waitForCondition(() -> {
+                    HybridTimestamp candidateTimestamp = getFieldValue(updateCandidate.get(), "lowWatermark");
+                    return candidateTimestamp.compareTo(oldReadTimestamp) > 0;
+                }, 30_000));
+                TimeUnit.SECONDS.sleep(2);
+                assertFalse(snapshotInstalled.isDone(), "An active older RO transaction must delay low watermark completion");
+                assertFalse(node2.replicaManager().isLocalReplicaHealthyForRead(groupId));
+                assertReadOnlyDataFromNode2();
+                assertEquals(0, localReads.get());
+                assertEquals(4, remoteReads.get());
+                LOG.info("HF4_LWM_FIX phase=update-waiting healthy=false localReads={} remoteReads={}",
+                        localReads.get(), remoteReads.get());
+                historicalTransaction.rollback();
+                assertThat(snapshotInstalled, willSucceedIn(1, TimeUnit.MINUTES));
+                assertTrue(waitForCondition(() -> node2.replicaManager().isLocalReplicaHealthyForRead(groupId), 30_000));
+                HybridTimestamp node2Watermark = node2.lowWatermark().getLowWatermark();
+                assertNotNull(node2Watermark);
+                assertTrue(node2Watermark.compareTo(oldReadTimestamp) > 0);
+                IgniteInternalException rejection = assertThrows(IgniteInternalException.class,
+                        () -> readAtTimestamp(2, 1, oldReadTimestamp));
+                assertEquals(TX_READ_ONLY_TOO_OLD_ERR, rejection.code());
+                assertReadOnlyDataFromNode2();
+                assertEquals(2, localReads.get());
+                assertEquals(4, remoteReads.get());
+                LOG.info("HF4_LWM_FIX phase=recovered healthy=true receiverWatermark={} readTimestamp={} "
+                                + "oldReadRejected=true localReads={} remoteReads={}",
+                        node2Watermark, oldReadTimestamp, localReads.get(), remoteReads.get());
+            } finally {
+                historicalTransaction.rollback();
+                node2.stopDroppingMessages();
+            }
+        } finally {
+            node0.stopDroppingMessages();
+        }
+    }
+
+    private String readAtTimestamp(int nodeIndex, int key, HybridTimestamp timestamp) {
+        IgniteImpl node = unwrapIgniteImpl(cluster.node(nodeIndex));
+        InternalTransaction tx = node.txManager().beginExplicitRo(
+                node.observableTimeTracker(), InternalTxOptions.builder().readTimestamp(timestamp).build());
+
+        try {
+            return tableViewAt(nodeIndex).get(tx, key);
+        } finally {
+            tx.rollback();
+        }
+    }
+
+    /** Stops a real node while its snapshot copier is waiting for an unanswered low-watermark RPC. */
+    @Test
+    @EnabledIfEnvironmentVariable(named = "IGNITE_HF4_LWM_CANCEL_PROBE", matches = "true")
+    @Timeout(value = 5, unit = TimeUnit.MINUTES)
+    void lowWatermarkPendingCancellationProbe() throws Exception {
+        createTestTableWith3Replicas(PersistentPageMemoryStorageEngine.ENGINE_NAME);
+        pauseForSnapshotProbe("cancel-table-created");
+        transferLeadershipOnSolePartitionTo(0);
+        pauseForSnapshotProbe("cancel-leader-transferred");
+        transferPrimaryOnSolePartitionTo(0);
+        pauseForSnapshotProbe("cancel-primary-transferred");
+        putToNode(0, 1, "one");
+        pauseForSnapshotProbe("cancel-first-write");
+        knockoutNode(2);
+        pauseForSnapshotProbe("cancel-node2-stopped");
+        putToNode(0, 2, "two");
+        pauseForSnapshotProbe("cancel-second-write");
+        causeLogTruncationOnSolePartitionLeader(0);
+        pauseForSnapshotProbe("cancel-leader-log-truncated");
+
+        CompletableFuture<Void> firstLowWatermarkResponse = new CompletableFuture<>();
+        CompletableFuture<Void> copierCanceled = new CompletableFuture<>();
+        CompletableFuture<Void> successfulInstall = new CompletableFuture<>();
+        copierLogInspector.addHandler(
+                event -> event.getMessage().getFormattedMessage().startsWith("Copier is canceled for partition"),
+                () -> copierCanceled.complete(null)
+        );
+        listenForSnapshotInstalledSuccessFromLogger(0, 2, successfulInstall);
+
+        IgniteImpl node0 = unwrapIgniteImpl(cluster.node(0));
+        String node2Name = cluster.nodeName(2);
+        node0.dropMessages((recipient, message) -> {
+            if (node2Name.equals(recipient) && message instanceof GetLowWatermarkResponse) {
+                firstLowWatermarkResponse.complete(null);
+                return true;
+            }
+
+            return false;
+        });
+
+        try {
+            reanimateNode(2);
+            pauseForSnapshotProbe("cancel-node2-restarted");
+            assertThat(firstLowWatermarkResponse, willSucceedIn(1, TimeUnit.MINUTES));
+            assertFalse(successfulInstall.isDone(), "Snapshot must not report success while low watermark is pending");
+            pauseForSnapshotProbe("cancel-lwm-pending");
+
+            long startedAt = System.nanoTime();
+            knockoutNode(2);
+            long stopMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+            LOG.info("HF4_LWM_CANCEL_PROBE phase=stopped stopMillis={} copierCanceled={} successfulInstall={}",
+                    stopMillis, copierCanceled.isDone(), successfulInstall.isDone());
+            assertTrue(stopMillis < TimeUnit.MINUTES.toMillis(1), "Stopping the node must not wait for the 10-minute LWM timeout");
+            assertThat(copierCanceled, willSucceedIn(10, TimeUnit.SECONDS));
+            pauseForSnapshotProbe("cancel-status-settled");
+            assertFalse(successfulInstall.isDone(), "A canceled snapshot must not be reported as successful");
+            pauseForSnapshotProbe("cancel-fault-released");
+        } finally {
+            node0.stopDroppingMessages();
+        }
+
+        reanimateNode(2);
+        pauseForSnapshotProbe("cancel-node2-restarted-again");
+        ReplicationGroupId groupId = cluster.solePartitionId(TEST_ZONE_NAME, TEST_TABLE_NAME);
+        IgniteImpl node2 = unwrapIgniteImpl(cluster.node(2));
+        assertTrue(waitForCondition(() -> node2.replicaManager().isLocalReplicaHealthyForRead(groupId)
+                && mvPartitionAtNode(2).lastAppliedIndex() > 0, 60_000));
+        assertEquals("one", probeReadOnlyGetAtNode2(1));
+        pauseForSnapshotProbe("cancel-recovered-first-read");
+        assertEquals("two", probeReadOnlyGetAtNode2(2));
+        LOG.info("HF4_LWM_CANCEL_PROBE phase=recovered result=PASS lastApplied={} healthy={}",
+                mvPartitionAtNode(2).lastAppliedIndex(), node2.replicaManager().isLocalReplicaHealthyForRead(groupId));
+    }
+
+    /** Forces MV storage into REBALANCE after the local RO routing check has passed on a real cluster. */
+    @Test
+    @EnabledIfEnvironmentVariable(named = "IGNITE_HF4_READ_REBALANCE_RACE_PROBE", matches = "true")
+    @Timeout(value = 3, unit = TimeUnit.MINUTES)
+    void readOnlyLocalRoutingRebalanceRaceProbe() throws Exception {
+        createTestTableWith3Replicas(PersistentPageMemoryStorageEngine.ENGINE_NAME);
+        pauseForSnapshotProbe("race-table-created");
+        transferPrimaryOnSolePartitionTo(0);
+        pauseForSnapshotProbe("race-primary-transferred");
+        putToNode(0, 1, "one");
+        pauseForSnapshotProbe("race-first-write");
+
+        IgniteImpl node2 = unwrapIgniteImpl(cluster.node(2));
+        ReplicationGroupId groupId = cluster.solePartitionId(TEST_ZONE_NAME, TEST_TABLE_NAME);
+        assertTrue(waitForCondition(() -> node2.replicaManager().isLocalReplicaHealthyForRead(groupId), 30_000));
+        assertEquals("one", probeReadOnlyGetAtNode2(1));
+        pauseForSnapshotProbe("race-baseline-read");
+
+        InternalTableImpl internalTable = (InternalTableImpl) unwrapTableImpl(tableAt(2)).internalTable();
+        Predicate<ReplicationGroupId> originalReadiness = getFieldValue(internalTable, "localReplicaReady");
+        CountDownLatch thirdReadinessCheck = new CountDownLatch(1);
+        CountDownLatch releaseReadinessCheck = new CountDownLatch(1);
+        AtomicInteger readinessChecks = new AtomicInteger();
+        AtomicInteger localReads = new AtomicInteger();
+        AtomicInteger remoteReads = new AtomicInteger();
+        AtomicBoolean storageInRebalance = new AtomicBoolean();
+        AbstractPageMemoryMvPartitionStorage mvStorage = ((Wrapper) mvPartitionAtNode(2))
+                .unwrap(AbstractPageMemoryMvPartitionStorage.class);
+
+        node2.dropMessages((recipient, message) -> {
+            if (message instanceof ReadOnlySingleRowPkReplicaRequest) {
+                (node2.name().equals(recipient) ? localReads : remoteReads).incrementAndGet();
+            }
+
+            return false;
+        });
+
+        IgniteTestUtils.setFieldValue(internalTable, "localReplicaReady", (Predicate<ReplicationGroupId>) requestedGroupId -> {
+            if (readinessChecks.incrementAndGet() == 3) {
+                thirdReadinessCheck.countDown();
+
+                try {
+                    if (!releaseReadinessCheck.await(30, TimeUnit.SECONDS)) {
+                        throw new AssertionError("Timed out waiting to release local read routing check");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("Interrupted while holding local read routing check", e);
+                }
+            }
+
+            return originalReadiness.test(requestedGroupId);
+        });
+
+        try {
+            CompletableFuture<String> read = CompletableFuture.supplyAsync(() -> probeReadOnlyGetAtNode2(1, 60_000));
+            assertTrue(thirdReadinessCheck.await(30, TimeUnit.SECONDS));
+            pauseForSnapshotProbe("race-local-check-blocked");
+            mvStorage.startRebalance();
+            storageInRebalance.set(true);
+            pauseForSnapshotProbe("race-storage-in-rebalance");
+            releaseReadinessCheck.countDown();
+
+            String outcome = read.get(75, TimeUnit.SECONDS);
+            LOG.info("HF4_REBALANCE_RACE_PROBE phase=read outcome={} localReads={} remoteReads={} readinessChecks={}",
+                    outcome, localReads.get(), remoteReads.get(), readinessChecks.get());
+            assertEquals("one", outcome);
+            assertEquals(1, localReads.get());
+            assertEquals(1, remoteReads.get(), "The storage transition must trigger one Primary fallback");
+        } finally {
+            releaseReadinessCheck.countDown();
+            IgniteTestUtils.setFieldValue(internalTable, "localReplicaReady", originalReadiness);
+
+            if (storageInRebalance.get()) {
+                mvStorage.completeRebalance();
+            }
+
+            node2.stopDroppingMessages();
+        }
+
+        pauseForSnapshotProbe("race-storage-restored");
+        assertEquals("one", probeReadOnlyGetAtNode2(1));
+        LOG.info("HF4_REBALANCE_RACE_PROBE phase=recovered result=PASS");
+    }
+
+    private boolean snapshotInstallingOnNode2(ReplicationGroupId groupId) {
+        JraftServerImpl server = (JraftServerImpl) unwrapIgniteImpl(cluster.node(2)).raftManager().server();
+
+        return server.localNodes().stream()
+                .filter(nodeId -> nodeId.groupId().equals(groupId))
+                .map(server::raftGroupService)
+                .filter(Objects::nonNull)
+                .anyMatch(service -> service.getRaftNode().isInstallingSnapshot());
+    }
+
+    private void assertReadOnlyDataFromNode2() {
+        Transaction tx = cluster.node(2).transactions().begin(new TransactionOptions().readOnly(true).timeoutMillis(20_000));
+
+        try {
+            assertEquals("two", tableViewAt(2).get(tx, 2));
+            assertEquals(Map.of(2, "two"), tableViewAt(2).getAll(tx, Set.of(1, 2)));
+        } finally {
+            tx.rollback();
+        }
     }
 
     /**
@@ -607,7 +1326,7 @@ class ItTableRaftSnapshotsTest extends ClusterPerTestIntegrationTest {
     }
 
     private BiPredicate<String, NetworkMessage> dropSnapshotMetaResponse(CompletableFuture<Void> sentFirstSnapshotMetaResponse) {
-        String node2Name = cluster.node(2).name();
+        String node2Name = cluster.nodeName(2);
 
         return (targetConsistentId, message) -> {
             if (Objects.equals(targetConsistentId, node2Name) && message instanceof SnapshotMetaResponse) {

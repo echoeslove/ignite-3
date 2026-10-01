@@ -39,6 +39,14 @@ import org.jetbrains.annotations.TestOnly;
  */
 public interface RaftServer extends IgniteComponent {
     /**
+     * Returns whether the local Raft node is active, initialized, and not installing a snapshot.
+     *
+     * @param nodeId Local Raft node identifier.
+     * @return {@code true} if the local Raft node is currently eligible to serve reads.
+     */
+    boolean isLocalRaftNodeHealthyForRead(RaftNodeId nodeId);
+
+    /**
      * Returns cluster service.
      */
     @TestOnly

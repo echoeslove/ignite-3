@@ -72,7 +72,9 @@ import java.util.concurrent.Flow.Publisher;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
+import java.util.function.Predicate;
 import org.apache.ignite.internal.hlc.ClockService;
 import org.apache.ignite.internal.hlc.HybridClock;
 import org.apache.ignite.internal.hlc.HybridClockImpl;
@@ -106,6 +108,7 @@ import org.apache.ignite.internal.schema.BinaryRow;
 import org.apache.ignite.internal.schema.BinaryRowEx;
 import org.apache.ignite.internal.schema.NullBinaryRow;
 import org.apache.ignite.internal.sql.SqlCommon;
+import org.apache.ignite.internal.storage.StorageRebalanceException;
 import org.apache.ignite.internal.storage.engine.MvTableStorage;
 import org.apache.ignite.internal.table.InternalTable;
 import org.apache.ignite.internal.table.StreamerReceiverRunner;
@@ -367,7 +370,7 @@ public class InternalTableImplTest extends BaseIgniteAbstractTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void localReadAttemptFallsBackWhenReplicaStopsDuringAssignmentsWait(boolean multiRow) {
+    void stoppedReplicaIsNotReadAfterAssignmentsWait(boolean multiRow) {
         InternalClusterNode local = new ClusterNodeImpl(randomUUID(), "backup", new NetworkAddress("host", 3001));
         AtomicBoolean ready = new AtomicBoolean(true);
         InternalTableImpl table = new InternalTableImpl(
@@ -382,9 +385,6 @@ public class InternalTableImplTest extends BaseIgniteAbstractTest {
         );
         CompletableFuture<TokenizedAssignments> assignments = new CompletableFuture<>();
         when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(assignments);
-        when(replicaService.invokeWithoutReplicaWait(eq(local), any())).thenReturn(failedFuture(
-                new ReplicaUnavailableException(new ZonePartitionId(ZONE_ID, 0), local)
-        ));
         when(replicaService.invoke(eq(clusterNode), any())).thenReturn(completedFuture(
                 multiRow ? Collections.singletonList(null) : null
         ));
@@ -395,9 +395,31 @@ public class InternalTableImplTest extends BaseIgniteAbstractTest {
         assignments.complete(new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(local.name())), 1));
 
         assertThat(read, willCompleteSuccessfully());
-        verify(replicaService).invokeWithoutReplicaWait(eq(local), any());
+        verify(replicaService, never()).invokeWithoutReplicaWait(eq(local), any());
         verify(replicaService).invoke(eq(clusterNode), any());
         verify(replicaService, never()).invoke(eq(local), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unhealthyReplicaIsNotReadAfterRecipientSelection(boolean multiRow) {
+        InternalClusterNode local = new ClusterNodeImpl(randomUUID(), "backup", new NetworkAddress("host", 3001));
+        AtomicInteger checks = new AtomicInteger();
+        InternalTableImpl table = localReadTable(local, groupId -> checks.incrementAndGet() < 3);
+        when(placementDriver.getAssignments(any(ReplicationGroupId.class), any(HybridTimestamp.class))).thenReturn(completedFuture(
+                new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(local.name())), 1)
+        ));
+        when(replicaService.invoke(eq(clusterNode), any())).thenReturn(completedFuture(
+                multiRow ? Collections.singletonList(null) : null
+        ));
+
+        InternalTransaction tx = explicitReadOnlyTransaction();
+
+        assertThat(multiRow ? table.getAll(List.of(createBinaryRow(0)), tx) : table.get(createBinaryRow(0), tx),
+                willCompleteSuccessfully());
+        assertEquals(3, checks.get());
+        verify(replicaService, never()).invokeWithoutReplicaWait(eq(local), any());
+        verify(replicaService).invoke(eq(clusterNode), any());
     }
 
     @ParameterizedTest
@@ -438,6 +460,7 @@ public class InternalTableImplTest extends BaseIgniteAbstractTest {
 
     @ParameterizedTest
     @CsvSource({"false,unavailable", "true,unavailable", "false,wrapped", "true,wrapped",
+            "false,rebalance", "true,rebalance", "false,wrappedRebalance", "true,wrappedRebalance",
             "false,businessError", "true,businessError", "false,missing", "true,missing"})
     void explicitReadOnlyFallbackPreservesSnapshotAndOnlyRetriesUnavailable(boolean multiRow, String scenario) {
         InternalClusterNode local = new ClusterNodeImpl(randomUUID(), "backup", new NetworkAddress("host", 3001));
@@ -446,13 +469,16 @@ public class InternalTableImplTest extends BaseIgniteAbstractTest {
                 new TokenizedAssignmentsImpl(Set.of(Assignment.forPeer(local.name())), 1)));
         Object response = multiRow ? Collections.singletonList(null) : null;
         Throwable failure = scenario.equals("businessError") ? new IllegalArgumentException("bad data")
-                : new ReplicaUnavailableException(new ZonePartitionId(ZONE_ID, 0), local);
-        if (scenario.equals("wrapped")) {
+                : scenario.equals("rebalance") || scenario.equals("wrappedRebalance")
+                        ? new StorageRebalanceException("Storage in the process of rebalancing")
+                        : new ReplicaUnavailableException(new ZonePartitionId(ZONE_ID, 0), local);
+        if (scenario.equals("wrapped") || scenario.equals("wrappedRebalance")) {
             failure = new CompletionException(failure);
         }
         when(replicaService.invokeWithoutReplicaWait(eq(local), any()))
                 .thenReturn(scenario.equals("missing") ? completedFuture(response) : failedFuture(failure));
-        boolean fallback = scenario.equals("unavailable") || scenario.equals("wrapped");
+        boolean fallback = scenario.equals("unavailable") || scenario.equals("wrapped")
+                || scenario.equals("rebalance") || scenario.equals("wrappedRebalance");
         if (fallback) {
             when(replicaService.invoke(eq(clusterNode), any())).thenReturn(completedFuture(response));
         }
@@ -764,6 +790,10 @@ public class InternalTableImplTest extends BaseIgniteAbstractTest {
     }
 
     private InternalTableImpl localReadTable(InternalClusterNode local, boolean ready) {
+        return localReadTable(local, groupId -> ready);
+    }
+
+    private InternalTableImpl localReadTable(InternalClusterNode local, Predicate<ReplicationGroupId> ready) {
         return new InternalTableImpl(
                 QualifiedName.fromSimple("test"), ZONE_ID, TABLE_ID, 1,
                 new SingleClusterNodeResolver(clusterNode), txManager,
@@ -772,7 +802,7 @@ public class InternalTableImplTest extends BaseIgniteAbstractTest {
                 new TransactionInflights(placementDriver, clockService),
                 () -> mock(ScheduledExecutorService.class), mock(StreamerReceiverRunner.class),
                 () -> 10_000L, () -> 10_000L, colocationEnabled(),
-                new TableMetricSource(QualifiedName.fromSimple("test")), () -> local, groupId -> ready
+                new TableMetricSource(QualifiedName.fromSimple("test")), () -> local, ready
         );
     }
 

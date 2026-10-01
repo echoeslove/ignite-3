@@ -20,7 +20,11 @@ import static org.apache.ignite.raft.jraft.util.BytesUtil.toByteArray;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
@@ -36,6 +40,7 @@ import org.apache.ignite.internal.raft.storage.impl.DefaultLogStorageFactory;
 import org.apache.ignite.internal.raft.storage.impl.IgniteJraftServiceFactory;
 import org.apache.ignite.internal.testframework.IgniteTestUtils;
 import org.apache.ignite.raft.jraft.FSMCaller;
+import org.apache.ignite.raft.jraft.JRaftServiceFactory;
 import org.apache.ignite.raft.jraft.JRaftUtils;
 import org.apache.ignite.raft.jraft.RaftMessagesFactory;
 import org.apache.ignite.raft.jraft.Status;
@@ -60,6 +65,7 @@ import org.apache.ignite.raft.jraft.rpc.RpcRequests;
 import org.apache.ignite.raft.jraft.rpc.RpcResponseClosure;
 import org.apache.ignite.raft.jraft.rpc.impl.FutureImpl;
 import org.apache.ignite.raft.jraft.storage.snapshot.Snapshot;
+import org.apache.ignite.raft.jraft.storage.snapshot.SnapshotCopier;
 import org.apache.ignite.raft.jraft.storage.snapshot.SnapshotExecutorImpl;
 import org.apache.ignite.raft.jraft.storage.snapshot.SnapshotReader;
 import org.apache.ignite.raft.jraft.storage.snapshot.local.LocalSnapshotMetaTable;
@@ -154,6 +160,55 @@ public class SnapshotExecutorTest extends BaseStorageTest {
         timerManager.shutdown();
         options.getCommonExecutor().shutdown();
         ExecutorServiceHelper.shutdownAndAwaitTermination(executorService);
+    }
+
+    @Test
+    public void testFailedCopierClearsDownloadingSnapshotForRetry() {
+        executor.shutdown();
+
+        JRaftServiceFactory serviceFactory = Mockito.mock(JRaftServiceFactory.class);
+        SnapshotStorage failingStorage = Mockito.mock(SnapshotStorage.class);
+        SnapshotCopier firstCopier = Mockito.mock(SnapshotCopier.class);
+        SnapshotCopier secondCopier = Mockito.mock(SnapshotCopier.class);
+
+        when(node.getServiceFactory()).thenReturn(serviceFactory);
+        when(serviceFactory.createSnapshotStorage(eq(path.toString()), any(RaftOptions.class))).thenReturn(failingStorage);
+        when(failingStorage.init(null)).thenReturn(true);
+        when(failingStorage.startToCopyFrom(eq("remote://localhost:8080/99"), any()))
+                .thenReturn(firstCopier, secondCopier);
+
+        for (SnapshotCopier copier : new SnapshotCopier[]{firstCopier, secondCopier}) {
+            when(copier.isOk()).thenReturn(false);
+            when(copier.getCode()).thenReturn(RaftError.UNKNOWN.getNumber());
+            when(copier.getErrorMsg()).thenReturn("Snapshot request timed out");
+        }
+
+        executor = new SnapshotExecutorImpl();
+
+        SnapshotExecutorOptions snapshotOptions = new SnapshotExecutorOptions();
+        snapshotOptions.setFsmCaller(fSMCaller);
+        snapshotOptions.setInitTerm(0);
+        snapshotOptions.setNode(node);
+        snapshotOptions.setLogManager(logManager);
+        snapshotOptions.setUri(path.toString());
+        snapshotOptions.setPeerId(new PeerId(peerId));
+        assertTrue(executor.init(snapshotOptions));
+
+        RaftMessagesFactory msgFactory = raftOptions.getRaftMessagesFactory();
+        RpcRequests.InstallSnapshotRequest request = msgFactory.installSnapshotRequest()
+                .groupId("test")
+                .peerId(peerId)
+                .serverId("localhost:8080")
+                .uri("remote://localhost:8080/99")
+                .term(0)
+                .meta(msgFactory.snapshotMeta().lastIncludedIndex(1).lastIncludedTerm(1).build())
+                .build();
+
+        executor.installSnapshot(request, msgFactory.installSnapshotResponse(), new RpcRequestClosure(asyncCtx, msgFactory));
+        executor.installSnapshot(request, msgFactory.installSnapshotResponse(), new RpcRequestClosure(asyncCtx, msgFactory));
+
+        verify(failingStorage, times(2)).startToCopyFrom(eq("remote://localhost:8080/99"), any());
+        verify(asyncCtx, times(2)).sendResponse(any());
     }
 
     @Test

@@ -86,6 +86,7 @@ import org.apache.ignite.internal.util.IgniteUtils;
 import org.apache.ignite.raft.jraft.Closure;
 import org.apache.ignite.raft.jraft.Iterator;
 import org.apache.ignite.raft.jraft.JRaftUtils;
+import org.apache.ignite.raft.jraft.Node;
 import org.apache.ignite.raft.jraft.NodeManager;
 import org.apache.ignite.raft.jraft.RaftGroupService;
 import org.apache.ignite.raft.jraft.Status;
@@ -758,6 +759,21 @@ public class JraftServerImpl implements RaftServer {
      */
     public RaftGroupService raftGroupService(RaftNodeId nodeId) {
         return nodes.get(nodeId);
+    }
+
+    @Override
+    public boolean isLocalRaftNodeHealthyForRead(RaftNodeId nodeId) {
+        RaftGroupService service = nodes.get(nodeId);
+
+        if (service == null) {
+            return false;
+        }
+
+        return isHealthyForRead(service.getRaftNode());
+    }
+
+    static boolean isHealthyForRead(@Nullable Node node) {
+        return node != null && node.getNodeState().isActive() && node.lastLogIndex() > 0 && !node.isInstallingSnapshot();
     }
 
     /** {@inheritDoc} */

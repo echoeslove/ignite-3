@@ -198,8 +198,9 @@ public interface PartitionMvStorageAccess {
      * Updates the low watermark if it is higher than the current one.
      *
      * @param newLowWatermark Candidate for update.
+     * @return Future completed after an equal or higher low watermark update has completed.
      */
-    void updateLowWatermark(HybridTimestamp newLowWatermark);
+    CompletableFuture<Void> updateLowWatermark(HybridTimestamp newLowWatermark);
 
     /** Returns {@code true} if this storage is volatile (i.e. stores its data in memory), or {@code false} if it's persistent. */
     boolean isVolatile();

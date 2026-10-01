@@ -23,7 +23,7 @@ import static org.apache.ignite.internal.catalog.commands.CatalogUtils.DEFAULT_P
 import static org.apache.ignite.internal.hlc.HybridTimestamp.hybridTimestampToLong;
 import static org.apache.ignite.internal.partition.replicator.raft.snapshot.outgoing.SnapshotMetaUtils.snapshotMetaAt;
 import static org.apache.ignite.internal.testframework.IgniteTestUtils.runAsync;
-import static org.apache.ignite.internal.testframework.matchers.CompletableFutureExceptionMatcher.willThrowFast;
+import static org.apache.ignite.internal.testframework.matchers.CompletableFutureExceptionMatcher.willTimeoutFast;
 import static org.apache.ignite.internal.testframework.matchers.CompletableFutureMatcher.willCompleteSuccessfully;
 import static org.apache.ignite.internal.testframework.matchers.CompletableFutureMatcher.willSucceedIn;
 import static org.apache.ignite.internal.tx.TxState.ABORTED;
@@ -36,6 +36,7 @@ import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -43,6 +44,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -64,6 +66,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import org.apache.ignite.internal.binarytuple.BinaryTupleReader;
 import org.apache.ignite.internal.catalog.Catalog;
 import org.apache.ignite.internal.catalog.CatalogService;
@@ -77,6 +80,7 @@ import org.apache.ignite.internal.lowwatermark.message.GetLowWatermarkRequest;
 import org.apache.ignite.internal.lowwatermark.message.LowWatermarkMessagesFactory;
 import org.apache.ignite.internal.network.InternalClusterNode;
 import org.apache.ignite.internal.network.MessagingService;
+import org.apache.ignite.internal.network.NetworkMessage;
 import org.apache.ignite.internal.network.TopologyService;
 import org.apache.ignite.internal.partition.replicator.network.PartitionReplicationMessagesFactory;
 import org.apache.ignite.internal.partition.replicator.network.raft.SnapshotMetaRequest;
@@ -298,7 +302,7 @@ public class IncomingSnapshotCopierTest extends BaseIgniteAbstractTest {
 
         verify(indexUpdateHandler).setNextRowIdToBuildIndex(eq(indexId), eq(nextRowIdToBuildIndex));
 
-        verify(lowWatermark).updateLowWatermark(eq(newLowWatermarkValue));
+        verify(lowWatermark).updateLowWatermarkAsync(eq(newLowWatermarkValue));
     }
 
     private void createTargetStorages() {
@@ -600,6 +604,7 @@ public class IncomingSnapshotCopierTest extends BaseIgniteAbstractTest {
 
         verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID), never()).startRebalance();
         verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID), never()).abortRebalance();
+        verify(replicaManager, never()).destroyReplicationProtocolStorages(any(), anyBoolean());
     }
 
     @Test
@@ -638,6 +643,252 @@ public class IncomingSnapshotCopierTest extends BaseIgniteAbstractTest {
         assertThat(cancelAndJoinFuture, willSucceedIn(1, TimeUnit.SECONDS));
 
         verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID)).abortRebalance();
+    }
+
+    @Test
+    void failedMvDataRequestAbortsRebalanceAndReturnsCopierError() throws Exception {
+        createTargetStorages();
+
+        MessagingService messagingService = mock(MessagingService.class);
+        returnSnapshotMetaWhenAskedForIt(messagingService);
+        when(messagingService.invoke(any(InternalClusterNode.class), any(SnapshotMvDataRequest.class), anyLong()))
+                .thenReturn(CompletableFuture.failedFuture(new TimeoutException("Snapshot MV data response timed out")));
+
+        PartitionSnapshotStorage partitionSnapshotStorage = createPartitionSnapshotStorage(
+                incomingMvTableStorage,
+                incomingTxStateStorage,
+                messagingService
+        );
+
+        SnapshotCopier snapshotCopier = partitionSnapshotStorage.startIncomingSnapshot(
+                SnapshotUri.toStringUri(snapshotId, NODE_NAME)
+        );
+
+        assertThat(runAsync(snapshotCopier::join), willSucceedIn(1, TimeUnit.SECONDS));
+        assertFalse(snapshotCopier.isOk());
+        verify(messagingService).invoke(eq(clusterNode), any(SnapshotMvDataRequest.class), eq(TimeUnit.MINUTES.toMillis(2)));
+        verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID)).abortRebalance();
+        verify(partitionSnapshotStorage.failureProcessor(), never()).process(any());
+    }
+
+    @Test
+    void failedMetaRequestReturnsCopierErrorWithoutStartingRebalance() throws Exception {
+        createTargetStorages();
+
+        MessagingService messagingService = mock(MessagingService.class);
+        when(messagingService.invoke(any(InternalClusterNode.class), any(SnapshotMetaRequest.class), anyLong()))
+                .thenReturn(CompletableFuture.failedFuture(new TimeoutException("Snapshot meta response timed out")));
+
+        PartitionSnapshotStorage partitionSnapshotStorage = createPartitionSnapshotStorage(
+                incomingMvTableStorage, incomingTxStateStorage, messagingService
+        );
+
+        SnapshotCopier snapshotCopier = partitionSnapshotStorage.startIncomingSnapshot(
+                SnapshotUri.toStringUri(snapshotId, NODE_NAME)
+        );
+
+        assertThat(runAsync(snapshotCopier::join), willSucceedIn(1, TimeUnit.SECONDS));
+        assertFalse(snapshotCopier.isOk());
+        verify(messagingService).invoke(eq(clusterNode), any(SnapshotMetaRequest.class), eq(TimeUnit.MINUTES.toMillis(2)));
+        verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID), never()).startRebalance();
+        verify(partitionSnapshotStorage.failureProcessor(), never()).process(any());
+    }
+
+    @Test
+    void failedTxDataRequestAbortsRebalanceAndReturnsCopierError() throws Exception {
+        fillOriginalStorages();
+        createTargetStorages();
+
+        MessagingService messagingService = messagingServiceForSuccessScenario(
+                outgoingMvPartitionStorage, outgoingTxStatePartitionStorage, rowIds, txIds
+        );
+        doReturn(CompletableFuture.failedFuture(new TimeoutException("Snapshot TX data response timed out")))
+                .when(messagingService).invoke(eq(clusterNode), any(SnapshotTxDataRequest.class), anyLong());
+
+        PartitionSnapshotStorage partitionSnapshotStorage = createPartitionSnapshotStorage(
+                incomingMvTableStorage, incomingTxStateStorage, messagingService
+        );
+
+        SnapshotCopier snapshotCopier = partitionSnapshotStorage.startIncomingSnapshot(
+                SnapshotUri.toStringUri(snapshotId, NODE_NAME)
+        );
+
+        assertThat(runAsync(snapshotCopier::join), willSucceedIn(1, TimeUnit.SECONDS));
+        assertFalse(snapshotCopier.isOk());
+        verify(messagingService).invoke(eq(clusterNode), any(SnapshotTxDataRequest.class), eq(TimeUnit.MINUTES.toMillis(2)));
+        verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID)).abortRebalance();
+        verify(partitionSnapshotStorage.failureProcessor(), never()).process(any());
+    }
+
+    @Test
+    void lowWatermarkRequestFailureAbortsRebalance() throws Exception {
+        fillOriginalStorages();
+        createTargetStorages();
+
+        MessagingService messagingService = messagingServiceForSuccessScenario(
+                outgoingMvPartitionStorage, outgoingTxStatePartitionStorage, rowIds, txIds
+        );
+        doReturn(CompletableFuture.failedFuture(new TimeoutException("Low watermark response timed out")))
+                .when(messagingService).invoke(eq(clusterNode), any(GetLowWatermarkRequest.class), anyLong());
+
+        PartitionSnapshotStorage partitionSnapshotStorage = createPartitionSnapshotStorage(
+                incomingMvTableStorage, incomingTxStateStorage, messagingService
+        );
+
+        SnapshotCopier snapshotCopier = partitionSnapshotStorage.startIncomingSnapshot(
+                SnapshotUri.toStringUri(snapshotId, NODE_NAME)
+        );
+
+        assertThat(runAsync(snapshotCopier::join), willSucceedIn(1, TimeUnit.SECONDS));
+        assertFalse(snapshotCopier.isOk());
+        verify(messagingService).invoke(eq(clusterNode), any(GetLowWatermarkRequest.class), eq(TimeUnit.MINUTES.toMillis(2)));
+        verify(incomingMvTableStorage, never()).finishRebalancePartition(eq(PARTITION_ID), any(MvPartitionMeta.class));
+        verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID)).abortRebalance();
+        verify(partitionSnapshotStorage.failureProcessor(), never()).process(any());
+    }
+
+    @Test
+    void cancellationBeforeCompletedRebalanceDoesNotWaitForLowWatermarkResponse() throws Exception {
+        fillOriginalStorages();
+        createTargetStorages();
+
+        MessagingService messagingService = messagingServiceForSuccessScenario(
+                outgoingMvPartitionStorage, outgoingTxStatePartitionStorage, rowIds, txIds
+        );
+        CompletableFuture<NetworkMessage> lowWatermarkResponse = new CompletableFuture<>();
+        CountDownLatch lowWatermarkRequestSent = new CountDownLatch(1);
+
+        doAnswer(invocation -> {
+            if (lowWatermarkRequestSent.getCount() != 0) {
+                lowWatermarkRequestSent.countDown();
+
+                return lowWatermarkResponse;
+            }
+
+            long lowWatermarkValue = hybridTimestampToLong(lowWatermark.getLowWatermark());
+
+            return completedFuture(LWM_MSG_FACTORY.getLowWatermarkResponse().lowWatermark(lowWatermarkValue).build());
+        }).when(messagingService).invoke(eq(clusterNode), any(GetLowWatermarkRequest.class), anyLong());
+
+        PartitionSnapshotStorage partitionSnapshotStorage = createPartitionSnapshotStorage(
+                incomingMvTableStorage, incomingTxStateStorage, messagingService
+        );
+
+        SnapshotCopier snapshotCopier = partitionSnapshotStorage.startIncomingSnapshot(
+                SnapshotUri.toStringUri(snapshotId, NODE_NAME)
+        );
+
+        assertTrue(lowWatermarkRequestSent.await(1, TimeUnit.SECONDS));
+        verify(incomingMvTableStorage, never()).finishRebalancePartition(eq(PARTITION_ID), any(MvPartitionMeta.class));
+
+        CompletableFuture<?> cancellation = runAsync(() -> {
+            snapshotCopier.cancel();
+            snapshotCopier.join();
+        });
+
+        try {
+            assertThat(cancellation, willSucceedIn(1, TimeUnit.SECONDS));
+            assertTrue(lowWatermarkResponse.isCancelled());
+            assertEquals(RaftError.ECANCELED.getNumber(), snapshotCopier.getCode());
+
+            SnapshotCopier nextCopier = partitionSnapshotStorage.startIncomingSnapshot(
+                    SnapshotUri.toStringUri(snapshotId, NODE_NAME)
+            );
+
+            assertThat(runAsync(nextCopier::join), willSucceedIn(1, TimeUnit.SECONDS));
+            assertEquals(Status.OK().getCode(), nextCopier.getCode());
+            verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID)).abortRebalance();
+        } finally {
+            lowWatermarkResponse.complete(null);
+        }
+    }
+
+    @Test
+    void lowWatermarkUpdateFailureAbortsRebalance() throws Exception {
+        fillOriginalStorages();
+        createTargetStorages();
+        MessagingService messagingService = messagingServiceForSuccessScenario(
+                outgoingMvPartitionStorage, outgoingTxStatePartitionStorage, rowIds, txIds);
+        doReturn(completedFuture(LWM_MSG_FACTORY.getLowWatermarkResponse().lowWatermark(CLOCK.now().longValue()).build()))
+                .when(messagingService).invoke(eq(clusterNode), any(GetLowWatermarkRequest.class), anyLong());
+        doReturn(CompletableFuture.failedFuture(new TimeoutException("Low watermark update timed out")))
+                .when(lowWatermark).updateLowWatermarkAsync(any());
+
+        PartitionSnapshotStorage storage = createPartitionSnapshotStorage(incomingMvTableStorage, incomingTxStateStorage, messagingService);
+        SnapshotCopier copier = storage.startIncomingSnapshot(SnapshotUri.toStringUri(snapshotId, NODE_NAME));
+
+        assertThat(runAsync(copier::join), willSucceedIn(1, TimeUnit.SECONDS));
+        assertFalse(copier.isOk());
+        verify(incomingMvTableStorage, never()).finishRebalancePartition(eq(PARTITION_ID), any(MvPartitionMeta.class));
+        verify(storage.partitionsByTableId().get(TABLE_ID)).abortRebalance();
+        verify(storage.failureProcessor(), never()).process(any());
+    }
+
+    @Test
+    void rebalanceWaitsForLowWatermarkUpdate() throws Exception {
+        fillOriginalStorages();
+        createTargetStorages();
+        MessagingService messagingService = messagingServiceForSuccessScenario(
+                outgoingMvPartitionStorage, outgoingTxStatePartitionStorage, rowIds, txIds);
+        doReturn(completedFuture(LWM_MSG_FACTORY.getLowWatermarkResponse().lowWatermark(CLOCK.now().longValue()).build()))
+                .when(messagingService).invoke(eq(clusterNode), any(GetLowWatermarkRequest.class), anyLong());
+
+        CompletableFuture<Void> updateFuture = new CompletableFuture<>();
+        CountDownLatch updateStarted = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            updateStarted.countDown();
+            return updateFuture;
+        }).when(lowWatermark).updateLowWatermarkAsync(any());
+
+        PartitionSnapshotStorage storage = createPartitionSnapshotStorage(incomingMvTableStorage, incomingTxStateStorage, messagingService);
+        SnapshotCopier copier = storage.startIncomingSnapshot(SnapshotUri.toStringUri(snapshotId, NODE_NAME));
+        CompletableFuture<?> join = runAsync(copier::join);
+
+        try {
+            assertTrue(updateStarted.await(1, TimeUnit.SECONDS));
+            assertThat(join, willTimeoutFast());
+            verify(incomingMvTableStorage, never()).finishRebalancePartition(eq(PARTITION_ID), any(MvPartitionMeta.class));
+            updateFuture.complete(null);
+            assertThat(join, willSucceedIn(1, TimeUnit.SECONDS));
+            assertTrue(copier.isOk());
+            verify(incomingMvTableStorage).finishRebalancePartition(eq(PARTITION_ID), any(MvPartitionMeta.class));
+        } finally {
+            updateFuture.complete(null);
+            copier.cancel();
+        }
+    }
+
+    @Test
+    void cancellationDoesNotCancelNodeWideLowWatermarkUpdate() throws Exception {
+        fillOriginalStorages();
+        createTargetStorages();
+        MessagingService messagingService = messagingServiceForSuccessScenario(
+                outgoingMvPartitionStorage, outgoingTxStatePartitionStorage, rowIds, txIds);
+        doReturn(completedFuture(LWM_MSG_FACTORY.getLowWatermarkResponse().lowWatermark(CLOCK.now().longValue()).build()))
+                .when(messagingService).invoke(eq(clusterNode), any(GetLowWatermarkRequest.class), anyLong());
+
+        CompletableFuture<Void> updateFuture = new CompletableFuture<>();
+        CountDownLatch updateStarted = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            updateStarted.countDown();
+            return updateFuture;
+        }).when(lowWatermark).updateLowWatermarkAsync(any());
+
+        PartitionSnapshotStorage storage = createPartitionSnapshotStorage(incomingMvTableStorage, incomingTxStateStorage, messagingService);
+        SnapshotCopier copier = storage.startIncomingSnapshot(SnapshotUri.toStringUri(snapshotId, NODE_NAME));
+
+        try {
+            assertTrue(updateStarted.await(1, TimeUnit.SECONDS));
+            assertThat(runAsync(copier::cancel), willSucceedIn(1, TimeUnit.SECONDS));
+            assertEquals(RaftError.ECANCELED.getNumber(), copier.getCode());
+            assertFalse(updateFuture.isDone(), "Cancel only the snapshot wait, not the shared node-wide update");
+            verify(incomingMvTableStorage, never()).finishRebalancePartition(eq(PARTITION_ID), any(MvPartitionMeta.class));
+            verify(storage.partitionsByTableId().get(TABLE_ID)).abortRebalance();
+            verify(storage.failureProcessor(), never()).process(any());
+        } finally {
+            updateFuture.complete(null);
+            copier.cancel();
+        }
     }
 
     @Test
@@ -715,8 +966,9 @@ public class IncomingSnapshotCopierTest extends BaseIgniteAbstractTest {
                 SnapshotUri.toStringUri(snapshotId, NODE_NAME)
         );
 
-        // Let's wait for an error on rebalancing.
-        assertThat(runAsync(snapshotCopier::join), willThrowFast(IllegalStateException.class));
+        // The error is reported through the copier status so that JRaft can clean up the failed installation.
+        assertThat(runAsync(snapshotCopier::join), willSucceedIn(1, TimeUnit.SECONDS));
+        assertFalse(snapshotCopier.isOk());
 
         verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID)).abortRebalance();
 

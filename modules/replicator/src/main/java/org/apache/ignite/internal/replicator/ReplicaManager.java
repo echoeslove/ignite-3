@@ -808,6 +808,19 @@ public class ReplicaManager extends AbstractEventProducer<LocalReplicaEvent, Loc
     }
 
     /**
+     * Returns whether the local replica is started and its Raft node is eligible to serve reads.
+     *
+     * <p>This is a point-in-time check and does not inspect the table's MV partition storage.
+     *
+     * @param replicationGroupId Replication group identifier.
+     * @return {@code true} if the local replica and its Raft node are currently eligible to serve reads.
+     */
+    public boolean isLocalReplicaHealthyForRead(ReplicationGroupId replicationGroupId) {
+        return isReplicaReady(replicationGroupId)
+                && raftManager.isLocalRaftNodeHealthyForRead(new RaftNodeId(replicationGroupId, new Peer(localNodeConsistentId)));
+    }
+
+    /**
      * Performs a {@code resetPeers} operation on raft node.
      *
      * @param replicaGrpId Replication group ID.

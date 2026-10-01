@@ -125,6 +125,7 @@ import org.apache.ignite.internal.schema.BinaryRow;
 import org.apache.ignite.internal.schema.BinaryRowEx;
 import org.apache.ignite.internal.schema.BinaryTuple;
 import org.apache.ignite.internal.schema.BinaryTuplePrefix;
+import org.apache.ignite.internal.storage.StorageRebalanceException;
 import org.apache.ignite.internal.storage.engine.MvTableStorage;
 import org.apache.ignite.internal.table.InternalTable;
 import org.apache.ignite.internal.table.StreamerReceiverRunner;
@@ -2288,6 +2289,15 @@ public class InternalTableImpl implements InternalTable {
                 .thenCompose(recipient -> {
                     readOnlyRoutingWaitMillis(tx);
 
+                    if (recipient.localAttempt && !localReplicaReady.test(targetReplicationGroupId(partId))) {
+                        return evaluateReadOnlyPrimaryRecipientNode(targetReplicationGroupId(partId), readTimestamp)
+                                .thenCompose(primaryNode -> {
+                                    readOnlyRoutingWaitMillis(tx);
+
+                                    return request.apply(primaryNode, false);
+                                });
+                    }
+
                     return request.apply(recipient.node, recipient.localAttempt)
                             .<CompletableFuture<T>>handle((result, error) -> {
                                 if (error == null || !recipient.localAttempt || !isLocalReplicaUnavailable(error)) {
@@ -2320,7 +2330,9 @@ public class InternalTableImpl implements InternalTable {
     }
 
     private static boolean isLocalReplicaUnavailable(Throwable error) {
-        return hasCause(error, ReplicaUnavailableException.class) || hasCause(error, AwaitReplicaTimeoutException.class);
+        return hasCause(error, ReplicaUnavailableException.class)
+                || hasCause(error, AwaitReplicaTimeoutException.class)
+                || hasCause(error, StorageRebalanceException.class);
     }
 
     /**
@@ -2372,7 +2384,7 @@ public class InternalTableImpl implements InternalTable {
                     .thenCompose(localPeer -> {
                         readOnlyRoutingWaitMillis(tx);
 
-                        return localPeer == null
+                        return localPeer == null || !localReplicaReady.test(replicationGroupId)
                                 ? evaluateReadOnlyPrimaryRecipientNode(replicationGroupId, readTimestamp)
                                         .thenApply(node -> new ReadOnlyRecipient(node, false))
                                 : completedFuture(new ReadOnlyRecipient(localPeer, true));

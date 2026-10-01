@@ -100,7 +100,8 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
 
     private static final LowWatermarkMessagesFactory LWM_MSG_FACTORY = new LowWatermarkMessagesFactory();
 
-    private static final long NETWORK_TIMEOUT = Long.MAX_VALUE;
+    /** Timeout for one snapshot request, not for transferring the whole snapshot. */
+    private static final long NETWORK_TIMEOUT_MILLIS = 120_000;
 
     private static final long MAX_MV_DATA_PAYLOADS_BATCH_BYTES_HINT = 100 * 1024;
 
@@ -127,6 +128,13 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
 
     @Nullable
     private volatile CompletableFuture<Void> rebalanceFuture;
+
+    @Nullable
+    private volatile CompletableFuture<?> lowWatermarkRequestFuture;
+
+    /** Cancellable wait for the sender's low watermark to take effect before completing rebalance. */
+    @Nullable
+    private volatile CompletableFuture<Void> lowWatermarkUpdateFuture;
 
     /**
      * Future is to wait in {@link #join()} because it is important for us to wait for the rebalance to finish or abort.
@@ -197,7 +205,8 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
                     return startRebalance(snapshotContext)
                             .thenCompose(v -> loadSnapshotMvData(snapshotContext, snapshotSender))
                             .thenCompose(v -> loadSnapshotTxData(snapshotSender))
-                            .thenRunAsync(() -> setNextRowIdToBuildIndexes(snapshotContext), executor);
+                            .thenRunAsync(() -> setNextRowIdToBuildIndexes(snapshotContext), executor)
+                            .thenCompose(v -> updateLowWatermark(snapshotContext, snapshotSender));
                 }, executor);
 
         this.rebalanceFuture = rebalanceFuture;
@@ -212,8 +221,7 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
 
                     return rebalanceFuture
                             .handleAsync((v, throwable) -> completeRebalance(snapshotContext, throwable), executor)
-                            .thenCompose(Function.identity())
-                            .thenCompose(v -> tryUpdateLowWatermark(snapshotContext, snapshotSender));
+                            .thenCompose(Function.identity());
                 });
     }
 
@@ -247,7 +255,9 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
             } catch (ExecutionException e) {
                 if (!hasCause(e, CancellationException.class, NodeStoppingException.class)) {
                     // TODO https://issues.apache.org/jira/browse/IGNITE-26811 HandshakeException is thrown when node is stopping.
-                    if (!hasCause(e, HandshakeException.class)) {
+                    if (hasCause(e, TimeoutException.class)) {
+                        LOG.warn("Snapshot request timed out while completing copier [partition={}]", createPartitionInfo(), e);
+                    } else if (!hasCause(e, HandshakeException.class)) {
                         partitionSnapshotStorage.failureProcessor().process(new FailureContext(e, "Error when completing the copier"));
                     }
 
@@ -255,8 +265,7 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
                         setError(RaftError.UNKNOWN, "Unknown error on completion the copier");
                     }
 
-                    // By analogy with LocalSnapshotCopier#join.
-                    throw new IllegalStateException(e);
+                    // Let SnapshotExecutorImpl inspect the error and clear its downloading snapshot state.
                 }
             }
         }
@@ -273,8 +282,13 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
 
         LOG.info("Copier is canceled for partition [{}]", createPartitionInfo());
 
+        if (isOk()) {
+            setError(RaftError.ECANCELED, "Copier is cancelled");
+        }
+
         // Cancel all futures that might be upstream wrt joinFuture.
-        List<CompletableFuture<?>> futuresToCancel = Stream.of(snapshotMetaFuture, rebalanceFuture)
+        List<CompletableFuture<?>> futuresToCancel = Stream.of(
+                        snapshotMetaFuture, rebalanceFuture, lowWatermarkRequestFuture, lowWatermarkUpdateFuture)
                 .filter(Objects::nonNull)
                 .collect(toList());
 
@@ -324,7 +338,7 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
             return partitionSnapshotStorage.messagingService().invoke(
                     snapshotSender,
                     TABLE_MSG_FACTORY.snapshotMetaRequest().id(snapshotUri.snapshotId).build(),
-                    NETWORK_TIMEOUT
+                    NETWORK_TIMEOUT_MILLIS
             ).thenApply(response -> {
                 PartitionSnapshotMeta snapshotMeta = ((SnapshotMetaResponse) response).meta();
 
@@ -374,7 +388,7 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
                             .id(snapshotUri.snapshotId)
                             .batchSizeHint(MAX_MV_DATA_PAYLOADS_BATCH_BYTES_HINT)
                             .build(),
-                    NETWORK_TIMEOUT
+                    NETWORK_TIMEOUT_MILLIS
             ).thenComposeAsync(response -> {
                 SnapshotMvDataResponse snapshotMvDataResponse = ((SnapshotMvDataResponse) response);
 
@@ -432,7 +446,7 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
                             .id(snapshotUri.snapshotId)
                             .maxTransactionsInBatch(MAX_TX_DATA_BATCH_SIZE)
                             .build(),
-                    NETWORK_TIMEOUT
+                    NETWORK_TIMEOUT_MILLIS
             ).thenComposeAsync(response -> {
                 SnapshotTxDataResponse snapshotTxDataResponse = (SnapshotTxDataResponse) response;
 
@@ -495,7 +509,12 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
         try {
             if (throwable != null) {
                 String errorMessage = String.format("Partition rebalancing error [%s]", createPartitionInfo());
-                partitionSnapshotStorage.failureProcessor().process(new FailureContext(throwable, errorMessage));
+
+                if (hasCause(throwable, TimeoutException.class)) {
+                    LOG.warn("Snapshot request timed out; aborting rebalance [partition={}]", createPartitionInfo(), throwable);
+                } else {
+                    partitionSnapshotStorage.failureProcessor().process(new FailureContext(throwable, errorMessage));
+                }
 
                 if (isOk()) {
                     setError(RaftError.UNKNOWN, throwable.getMessage());
@@ -659,26 +678,45 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
         }
     }
 
-    private CompletableFuture<Void> tryUpdateLowWatermark(SnapshotContext snapshotContext, InternalClusterNode snapshotSender) {
+    private CompletableFuture<Void> updateLowWatermark(SnapshotContext snapshotContext, InternalClusterNode snapshotSender) {
         if (!busyLock.enterBusy()) {
             return nullCompletedFuture();
         }
 
         try {
-            return partitionSnapshotStorage.messagingService().invoke(
+            var lowWatermarkRequestFuture = partitionSnapshotStorage.messagingService().invoke(
                     snapshotSender,
                     LWM_MSG_FACTORY.getLowWatermarkRequest().build(),
-                    NETWORK_TIMEOUT
-            ).thenAcceptAsync(response -> {
-                GetLowWatermarkResponse getLowWatermarkResponse = (GetLowWatermarkResponse) response;
+                    NETWORK_TIMEOUT_MILLIS
+            );
 
-                HybridTimestamp senderLowWatermark = nullableHybridTimestamp(getLowWatermarkResponse.lowWatermark());
+            this.lowWatermarkRequestFuture = lowWatermarkRequestFuture;
 
-                if (senderLowWatermark != null) {
-                    snapshotContext.partitionsByTableId.values()
-                            .forEach(mvPartition -> mvPartition.updateLowWatermark(senderLowWatermark));
+            CompletableFuture<Void> updateFuture = lowWatermarkRequestFuture.thenComposeAsync(response -> {
+                if (!busyLock.enterBusy()) {
+                    return failedFuture(new NodeStoppingException());
                 }
-            }, executor);
+
+                try {
+                    GetLowWatermarkResponse getLowWatermarkResponse = (GetLowWatermarkResponse) response;
+
+                    HybridTimestamp senderLowWatermark = nullableHybridTimestamp(getLowWatermarkResponse.lowWatermark());
+
+                    if (senderLowWatermark == null) {
+                        return nullCompletedFuture();
+                    }
+
+                    return aggregateFutureFromPartitions(
+                            mvPartition -> mvPartition.updateLowWatermark(senderLowWatermark), snapshotContext);
+                } finally {
+                    busyLock.leaveBusy();
+                }
+            }, executor).orTimeout(NETWORK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+
+            // Only this dependent wait is cancelled or timed out, never the node-wide low watermark update itself.
+            this.lowWatermarkUpdateFuture = updateFuture;
+
+            return updateFuture;
         } finally {
             busyLock.leaveBusy();
         }

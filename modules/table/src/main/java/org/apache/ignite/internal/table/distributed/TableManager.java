@@ -211,6 +211,7 @@ import org.apache.ignite.internal.storage.DataStorageManager;
 import org.apache.ignite.internal.storage.MvPartitionStorage;
 import org.apache.ignite.internal.storage.StorageClosedException;
 import org.apache.ignite.internal.storage.StorageDestroyedException;
+import org.apache.ignite.internal.storage.StorageException;
 import org.apache.ignite.internal.storage.engine.MvTableStorage;
 import org.apache.ignite.internal.storage.engine.StorageEngine;
 import org.apache.ignite.internal.storage.engine.StorageTableDescriptor;
@@ -1870,7 +1871,21 @@ public class TableManager implements IgniteTablesInternal, IgniteComponent {
                 nodeProperties.colocationEnabled(),
                 createAndRegisterMetricsSource(tableName),
                 topologyService::localMember,
-                replicaMgr::isReplicaReady
+                replicationGroupId -> {
+                    if (!replicaMgr.isLocalReplicaHealthyForRead(replicationGroupId)) {
+                        return false;
+                    }
+
+                    try {
+                        MvPartitionStorage partitionStorage = tableStorage.getMvPartition(
+                                ((PartitionGroupId) replicationGroupId).partitionId()
+                        );
+
+                        return partitionStorage != null && partitionStorage.lastAppliedIndex() > 0;
+                    } catch (StorageException e) {
+                        return false;
+                    }
+                }
         );
 
         return new TableImpl(

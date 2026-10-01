@@ -610,6 +610,19 @@ public class Loza implements RaftManager {
     }
 
     @Override
+    public boolean isLocalRaftNodeHealthyForRead(RaftNodeId nodeId) {
+        if (!busyLock.enterBusy()) {
+            return false;
+        }
+
+        try {
+            return raftServer.isLocalRaftNodeHealthyForRead(nodeId);
+        } finally {
+            busyLock.leaveBusy();
+        }
+    }
+
+    @Override
     public boolean stopRaftNode(RaftNodeId nodeId) throws NodeStoppingException {
         if (!busyLock.enterBusy()) {
             throw new NodeStoppingException();
