@@ -20,11 +20,13 @@ package org.apache.ignite.internal.raftsnapshot;
 import static org.apache.ignite.internal.TestWrappers.unwrapIgniteImpl;
 import static org.apache.ignite.internal.TestWrappers.unwrapTableViewInternal;
 import static org.apache.ignite.internal.testframework.matchers.CompletableFutureMatcher.willCompleteSuccessfully;
+import static org.apache.ignite.internal.util.ExceptionUtils.hasCause;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
@@ -63,12 +65,15 @@ import org.apache.ignite.internal.storage.pagememory.PersistentPageMemoryStorage
 import org.apache.ignite.internal.table.TableViewInternal;
 import org.apache.ignite.internal.testframework.ExecutorServiceExtension;
 import org.apache.ignite.internal.testframework.InjectExecutorService;
+import org.apache.ignite.internal.testframework.log4j2.LogInspector;
 import org.apache.ignite.internal.tx.storage.state.rocksdb.TxStateRocksDbSharedStorage;
 import org.apache.ignite.internal.tx.storage.state.rocksdb.TxStateRocksDbStorage;
 import org.apache.ignite.internal.util.Constants;
 import org.apache.ignite.raft.jraft.RaftGroupService;
 import org.apache.ignite.raft.jraft.Status;
+import org.apache.ignite.raft.jraft.core.NodeImpl;
 import org.apache.ignite.raft.jraft.error.RaftError;
+import org.apache.ignite.lang.NodeStartException;
 import org.apache.ignite.table.KeyValueView;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Test;
@@ -97,6 +102,42 @@ class ItInterruptedRaftSnapshotStorageRecoveryTest extends ClusterPerTestIntegra
     @Test
     void raftSnapshotWorksAfterNonFinishedRaftSnapshotInstallOnTxStateStorage() {
         testRaftSnapshotWorksAfterNonFinishedRaftSnapshotInstall(this::simulateNonFinishedRaftSnapshotInstallInTxStateStorage);
+    }
+
+    @Test
+    void alreadyClearedMvStorageWithTruncatedLogStillFailsToStart() {
+        assertAlreadyClearedStorageWithTruncatedLogFailsToStart(path -> simulateMvStorageState(path, true));
+    }
+
+    @Test
+    void alreadyClearedTxStorageWithTruncatedLogStillFailsToStart() {
+        assertAlreadyClearedStorageWithTruncatedLogFailsToStart(path -> simulateTxStorageState(path, true));
+    }
+
+    private void assertAlreadyClearedStorageWithTruncatedLogFailsToStart(Consumer<Path> clearStoppedStorage) {
+        createTableWithOnePartitionAnd3Replicas(TABLE_NAME);
+        putOneRowInExplicitTransaction();
+        waitForAllNodesToHave1RowInTable(TABLE_NAME);
+        truncateLogPrefixOnAllNodes(cluster.solePartitionId(ZONE_NAME, TABLE_NAME));
+
+        Path storagePath = unwrapIgniteImpl(cluster.node(2)).partitionsWorkDir().dbPath();
+        cluster.stopNode(2);
+        clearStoppedStorage.accept(storagePath);
+
+        var missingLogs = new CompletableFuture<String>();
+        LogInspector inspector = LogInspector.create(NodeImpl.class);
+        inspector.addHandler(
+                event -> event.getMessage().getFormattedMessage().contains("Missing logs in (0,"),
+                () -> missingLogs.complete("Missing logs in (0,")
+        );
+        inspector.start();
+        try {
+            AssertionError startFailure = assertThrows(AssertionError.class, () -> cluster.startNode(2));
+            assertTrue(hasCause(startFailure, NodeStartException.class));
+            assertThat(missingLogs, willCompleteSuccessfully());
+        } finally {
+            inspector.stop();
+        }
     }
 
     private void testRaftSnapshotWorksAfterNonFinishedRaftSnapshotInstall(Consumer<Path> executeOnStoppedNode2StoragePath) {
@@ -189,6 +230,10 @@ class ItInterruptedRaftSnapshotStorageRecoveryTest extends ClusterPerTestIntegra
     }
 
     private void simulateNonFinishedRaftSnapshotInstallInMvStorage(Path storagePath) {
+        simulateMvStorageState(storagePath, false);
+    }
+
+    private void simulateMvStorageState(Path storagePath, boolean cleared) {
         assertTrue(Files.exists(storagePath));
         assertTrue(Files.isDirectory(storagePath));
 
@@ -210,7 +255,12 @@ class ItInterruptedRaftSnapshotStorageRecoveryTest extends ClusterPerTestIntegra
                 }
             });
             assertThat(tableStorage.createMvPartition(0), willCompleteSuccessfully());
-            assertThat(tableStorage.startRebalancePartition(0), willCompleteSuccessfully());
+            if (cleared) {
+                assertThat(tableStorage.clearPartition(0), willCompleteSuccessfully());
+                assertEquals(0, tableStorage.getMvPartition(0).lastAppliedIndex());
+            } else {
+                assertThat(tableStorage.startRebalancePartition(0), willCompleteSuccessfully());
+            }
 
             // Flush to make sure it gets written to disk.
             flushPartition0(tableStorage);
@@ -246,6 +296,10 @@ class ItInterruptedRaftSnapshotStorageRecoveryTest extends ClusterPerTestIntegra
     }
 
     private void simulateNonFinishedRaftSnapshotInstallInTxStateStorage(Path storagePath) {
+        simulateTxStorageState(storagePath, false);
+    }
+
+    private void simulateTxStorageState(Path storagePath, boolean cleared) {
         Path txStateStoragePath = storagePath.resolve("tx-state");
         assertTrue(Files.exists(txStateStoragePath));
         assertTrue(Files.isDirectory(txStateStoragePath));
@@ -266,7 +320,12 @@ class ItInterruptedRaftSnapshotStorageRecoveryTest extends ClusterPerTestIntegra
             zoneTxStateStorage.start();
 
             var txStatePartitionStorage = zoneTxStateStorage.getOrCreatePartitionStorage(0);
-            assertThat(txStatePartitionStorage.startRebalance(), willCompleteSuccessfully());
+            if (cleared) {
+                assertThat(txStatePartitionStorage.clear(), willCompleteSuccessfully());
+                assertEquals(0, txStatePartitionStorage.lastAppliedIndex());
+            } else {
+                assertThat(txStatePartitionStorage.startRebalance(), willCompleteSuccessfully());
+            }
 
             // Flush to make sure it gets written to disk.
             sharedStorage.flush();

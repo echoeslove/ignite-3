@@ -17,21 +17,45 @@
 
 package org.apache.ignite.internal.util;
 
+import static org.apache.ignite.lang.ErrorGroups.Common.INTERNAL_ERR;
+
 import java.util.Map;
 import org.apache.ignite.internal.hlc.HybridTimestamp;
 import org.apache.ignite.internal.lang.IgniteBiTuple;
+import org.apache.ignite.internal.lang.IgniteInternalException;
 import org.jetbrains.annotations.Nullable;
 
 /**
  * Safe time values tracker. Checks for reordering. Must be updated from a single thread.
  */
 public class SafeTimeValuesTracker extends PendingComparableValuesTracker<HybridTimestamp, Void> {
+    /** Index of the last command that successfully updated the safe timestamp. */
+    private long commandIndex;
+
+    /** Term of the last command that successfully updated the safe timestamp. */
+    private long commandTerm;
+
+    /** Class name of the last command, or {@code null} when no command context was supplied. */
+    private @Nullable String commandClassName;
+
     public SafeTimeValuesTracker(HybridTimestamp initialValue) {
         super(initialValue);
     }
 
     @Override
     public void update(HybridTimestamp newValue, @Nullable Void futureResult) {
+        update(newValue, 0, 0, null);
+    }
+
+    /**
+     * Updates the safe timestamp and records the command context for reordering diagnostics.
+     *
+     * @param safeTs New safe timestamp.
+     * @param commandIndex Command index, or zero when no command context is available.
+     * @param commandTerm Command term, or zero when no command context is available.
+     * @param command Command, or {@code null} when no command context is available.
+     */
+    public void update(HybridTimestamp safeTs, long commandIndex, long commandTerm, @Nullable Object command) {
         if (!enterBusy()) {
             throw new TrackerClosedException();
         }
@@ -39,15 +63,26 @@ public class SafeTimeValuesTracker extends PendingComparableValuesTracker<Hybrid
         try {
             Map.Entry<HybridTimestamp, @Nullable Void> current = this.current;
 
-            IgniteBiTuple<HybridTimestamp, @Nullable Void> newEntry = new IgniteBiTuple<>(newValue, futureResult);
+            IgniteBiTuple<HybridTimestamp, @Nullable Void> newEntry = new IgniteBiTuple<>(safeTs, null);
 
             // Entries from the same batch receive equal safe timestamps.
             if (comparator.compare(newEntry, current) < 0) {
-                throw new AssertionError("Reordering detected: [old=" + current.getKey() + ", new=" + newEntry.get1() + ']');
+                throw new IgniteInternalException(INTERNAL_ERR,
+                        "Reordering detected: [old=" + current.getKey() + ", new=" + newEntry.get1()
+                                + ", oldIndex=" + this.commandIndex
+                                + ", oldTerm=" + this.commandTerm
+                                + ", oldCommandClassName=" + this.commandClassName
+                                + ']');
             }
 
             CURRENT.set(this, newEntry);
-            completeWaitersOnUpdate(newValue, futureResult);
+
+            this.commandIndex = commandIndex;
+            this.commandTerm = commandTerm;
+            this.commandClassName = command == null ? null : command.getClass().getName();
+
+            // Ignite 3.1 also uses this tracker to wait for safe time; keep those readers notified.
+            completeWaitersOnUpdate(safeTs, null);
         } finally {
             leaveBusy();
         }
