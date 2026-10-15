@@ -34,6 +34,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -134,6 +135,23 @@ public class LowWatermarkImplTest extends BaseIgniteAbstractTest {
         verify(lwmChangedListener, never()).notify(any());
 
         assertNull(lowWatermark.getLowWatermark());
+    }
+
+    @Test
+    void recoveryWatermarkIsPersistedWithoutNotifyingListeners() {
+        HybridTimestamp recovered = new HybridTimestamp(100, 0);
+
+        lowWatermark.setLowWatermarkOnRecovery(recovered);
+
+        assertEquals(recovered, lowWatermark.getLowWatermark());
+        ArgumentCaptor<byte[]> value = ArgumentCaptor.forClass(byte[].class);
+        verify(vaultManager).put(eq(LOW_WATERMARK_VAULT_KEY), value.capture());
+        assertArrayEquals(recovered.toBytes(), value.getValue());
+        verify(lwmChangedListener, never()).notify(any());
+
+        assertThat(lowWatermark.updateLowWatermarkAsync(new HybridTimestamp(99, 0)), willCompleteSuccessfully());
+        assertEquals(recovered, lowWatermark.getLowWatermark());
+        verify(lwmChangedListener, never()).notify(any());
     }
 
     @Test

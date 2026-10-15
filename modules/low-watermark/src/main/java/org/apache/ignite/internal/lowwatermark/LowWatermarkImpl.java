@@ -164,7 +164,10 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
     @Override
     public CompletableFuture<Void> startAsync(ComponentContext componentContext) {
         return inBusyLockAsync(busyLock, () -> {
-            setLowWatermarkOnRecovery(readLowWatermarkFromVault());
+            HybridTimestamp lwmFromVault = readLowWatermarkFromVault();
+            if (lwmFromVault != null) {
+                setLowWatermarkOnRecovery(lwmFromVault);
+            }
 
             messagingService.addMessageHandler(LowWatermarkMessageGroup.class, this::onReceiveNetworkMessage);
 
@@ -291,11 +294,14 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
         lowWatermark = newLowWatermark;
     }
 
-    private void setLowWatermarkOnRecovery(@Nullable HybridTimestamp newLowWatermark) {
+    @Override
+    public void setLowWatermarkOnRecovery(HybridTimestamp newLowWatermark) {
         updateLowWatermarkLock.writeLock().lock();
 
         try {
             lowWatermark = newLowWatermark;
+
+            saveWatermarkToVault(newLowWatermark);
         } finally {
             updateLowWatermarkLock.writeLock().unlock();
         }
@@ -393,7 +399,7 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
 
     CompletableFuture<Void> updateAndNotify(HybridTimestamp newLowWatermark) {
         return inBusyLockAsync(busyLock, () -> {
-                    vaultManager.put(LOW_WATERMARK_VAULT_KEY, newLowWatermark.toBytes());
+                    saveWatermarkToVault(newLowWatermark);
 
                     return waitForLocksAndSetLowWatermark(newLowWatermark)
                             .thenComposeAsync(unused2 -> fireEvent(
@@ -412,6 +418,10 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
                             }, scheduledThreadPool);
                 }
         );
+    }
+
+    private void saveWatermarkToVault(HybridTimestamp newLowWatermark) {
+        vaultManager.put(LOW_WATERMARK_VAULT_KEY, newLowWatermark.toBytes());
     }
 
     private CompletableFuture<Void> waitForLocksAndSetLowWatermark(HybridTimestamp newLowWatermark) {
