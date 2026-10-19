@@ -29,6 +29,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
+import org.apache.ignite.internal.failure.FailureProcessor;
 import org.apache.ignite.internal.lang.NodeStoppingException;
 import org.apache.ignite.internal.logger.IgniteLogger;
 import org.apache.ignite.internal.logger.Loggers;
@@ -37,6 +38,7 @@ import org.apache.ignite.internal.network.InternalClusterNode;
 import org.apache.ignite.internal.network.NetworkMessage;
 import org.apache.ignite.internal.network.NetworkMessagesFactory;
 import org.apache.ignite.internal.network.OutNetworkObject;
+import org.apache.ignite.internal.network.TopologyService;
 import org.apache.ignite.internal.network.handshake.HandshakeEventLoopSwitcher;
 import org.apache.ignite.internal.network.handshake.HandshakeException;
 import org.apache.ignite.internal.network.handshake.HandshakeManager;
@@ -52,6 +54,7 @@ import org.apache.ignite.internal.network.recovery.message.HandshakeRejectedMess
 import org.apache.ignite.internal.network.recovery.message.HandshakeRejectionReason;
 import org.apache.ignite.internal.network.recovery.message.HandshakeStartMessage;
 import org.apache.ignite.internal.network.recovery.message.HandshakeStartResponseMessage;
+import org.apache.ignite.internal.network.recovery.message.HandshakeStartResponseV2Message;
 import org.apache.ignite.internal.network.recovery.message.ProbeMessage;
 import org.apache.ignite.internal.version.IgniteProductVersionSource;
 
@@ -104,6 +107,22 @@ public class RecoveryAcceptorHandshakeManager implements HandshakeManager {
 
     /** Recovery descriptor. */
     private RecoveryDescriptor recoveryDescriptor;
+
+    private TopologyService topologyService;
+
+    private FailureProcessor failureProcessor;
+
+    private boolean startSent;
+
+    private boolean versionedHandshake;
+
+    /** Enables probe negotiation before the channel is opened. */
+    public RecoveryAcceptorHandshakeManager withStaleRecovery(TopologyService topology, FailureProcessor processor) {
+        assert ctx == null;
+        topologyService = topology;
+        failureProcessor = processor;
+        return this;
+    }
 
     /**
      * Constructor.
@@ -166,7 +185,31 @@ public class RecoveryAcceptorHandshakeManager implements HandshakeManager {
     /** {@inheritDoc} */
     @Override
     public void onConnectionOpen() {
-        HandshakeStartMessage handshakeStartMessage = messageFactory.handshakeStartMessage()
+        // Every 3.1 initiator sends the existing probe on channelActive. Waiting for that probe lets us
+        // choose a new message type without ever sending an unknown type to an unpatched peer.
+        if (topologyService == null) {
+            sendHandshakeStart(false);
+        }
+    }
+
+    private void sendHandshakeStart(boolean versioned) {
+        if (startSent) {
+            return;
+        }
+        startSent = true;
+        if (topologyService != null && stopping.getAsBoolean()) {
+            sendRejectionMessageAndFailHandshake("Node is stopping", HandshakeRejectionReason.STOPPING,
+                    message -> new NodeStoppingException());
+            return;
+        }
+        versionedHandshake = versioned;
+        HandshakeStartMessage handshakeStartMessage = versioned ? messageFactory.handshakeStartV2Message()
+                .serverNode(HandshakeManagerUtils.clusterNodeToMessage(localNode))
+                .serverClusterId(clusterIdSupplier.clusterId())
+                .productName(productVersionSource.productName())
+                .productVersion(productVersionSource.productVersion().toString())
+                .topologyVersion(topologyService.logicalTopologyVersion())
+                .build() : messageFactory.handshakeStartMessage()
                 .serverNode(HandshakeManagerUtils.clusterNodeToMessage(localNode))
                 .serverClusterId(clusterIdSupplier.clusterId())
                 .productName(productVersionSource.productName())
@@ -188,7 +231,9 @@ public class RecoveryAcceptorHandshakeManager implements HandshakeManager {
     @Override
     public void onMessage(NetworkMessage message) {
         if (message instanceof ProbeMessage) {
-            // No action required, just ignore it.
+            if (topologyService != null) {
+                sendHandshakeStart(((ProbeMessage) message).dummy() == HandshakeManagerUtils.TOPOLOGY_VERSION_CAPABILITY);
+            }
             return;
         }
 
@@ -233,6 +278,26 @@ public class RecoveryAcceptorHandshakeManager implements HandshakeManager {
     }
 
     private boolean possiblyRejectHandshakeStartResponse(HandshakeStartResponseMessage message) {
+        if (versionedHandshake != (message instanceof HandshakeStartResponseV2Message)) {
+            sendRejectionMessageAndFailHandshake("Handshake capability mismatch", HandshakeRejectionReason.CLUSTER_ID_MISMATCH,
+                    HandshakeException::new);
+            return true;
+        }
+        if (message instanceof HandshakeStartResponseV2Message) {
+            HandshakeStartResponseV2Message v2 = (HandshakeStartResponseV2Message) message;
+            if (!productVersionSource.productName().equals(v2.productName())
+                    || !productVersionSource.productVersion().toString().equals(v2.productVersion())
+                    || (clusterIdSupplier.clusterId() != null && v2.clientClusterId() != null
+                            && !clusterIdSupplier.clusterId().equals(v2.clientClusterId()))) {
+                sendRejectionMessageAndFailHandshake("Handshake identity mismatch", HandshakeRejectionReason.CLUSTER_ID_MISMATCH,
+                        HandshakeException::new);
+                return true;
+            }
+        }
+        if (stopping.getAsBoolean()) {
+            handleRefusalToEstablishConnectionDueToStopping(message);
+            return true;
+        }
         if (staleIdDetector.isIdStale(message.clientNode().id())) {
             handleStaleInitiatorId(message);
 
@@ -254,6 +319,11 @@ public class RecoveryAcceptorHandshakeManager implements HandshakeManager {
         );
 
         sendRejectionMessageAndFailHandshake(message, HandshakeRejectionReason.STALE_LAUNCH_ID, HandshakeException::new);
+        if (versionedHandshake && clusterIdSupplier.clusterId() != null
+                && clusterIdSupplier.clusterId().equals(((HandshakeStartResponseV2Message) msg).clientClusterId())) {
+            HandshakeManagerUtils.maybeFailOnStaleNodeDetection(failureProcessor, topologyService.logicalTopologyVersion(),
+                    ((HandshakeStartResponseV2Message) msg).topologyVersion());
+        }
     }
 
     private void handleRefusalToEstablishConnectionDueToStopping(HandshakeStartResponseMessage msg) {

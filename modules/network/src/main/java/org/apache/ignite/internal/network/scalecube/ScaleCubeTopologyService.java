@@ -31,6 +31,7 @@ import java.util.NoSuchElementException;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import org.apache.ignite.internal.logger.IgniteLogger;
 import org.apache.ignite.internal.logger.Loggers;
@@ -53,6 +54,8 @@ final class ScaleCubeTopologyService extends AbstractTopologyService {
 
     /** Metadata codec. */
     private static final MetadataCodec METADATA_CODEC = MetadataCodec.INSTANCE;
+
+    private final AtomicLong logicalTopologyVersion = new AtomicLong();
 
     /**
      * Inner representation of a ScaleCube cluster.
@@ -344,6 +347,16 @@ final class ScaleCubeTopologyService extends AbstractTopologyService {
             LOG.debug("Node joined logical topology [node={}]", node);
         }
         membersByConsistentIdInLogicalTopology.put(node.name(), node);
+    }
+
+    @Override
+    public long logicalTopologyVersion() {
+        return logicalTopologyVersion.get();
+    }
+
+    @Override
+    public void onLogicalTopologyVersion(long version) {
+        logicalTopologyVersion.accumulateAndGet(version, Math::max);
     }
 
     @Override

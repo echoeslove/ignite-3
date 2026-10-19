@@ -163,7 +163,7 @@ public class ScaleCubeClusterServiceFactory {
                         clusterIdSupplier,
                         channelTypeRegistry,
                         productVersionSource
-                );
+                ).withStaleRecovery(topologyService, failureProcessor);
                 this.connectionMgr = connectionMgr;
 
                 connectionMgr.start();

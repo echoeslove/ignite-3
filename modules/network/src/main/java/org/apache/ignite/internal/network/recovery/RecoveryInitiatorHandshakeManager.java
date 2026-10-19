@@ -33,6 +33,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
+import org.apache.ignite.internal.failure.FailureProcessor;
 import org.apache.ignite.internal.lang.NodeStoppingException;
 import org.apache.ignite.internal.logger.IgniteLogger;
 import org.apache.ignite.internal.logger.Loggers;
@@ -41,6 +42,7 @@ import org.apache.ignite.internal.network.InternalClusterNode;
 import org.apache.ignite.internal.network.NetworkMessage;
 import org.apache.ignite.internal.network.NetworkMessagesFactory;
 import org.apache.ignite.internal.network.OutNetworkObject;
+import org.apache.ignite.internal.network.TopologyService;
 import org.apache.ignite.internal.network.handshake.ChannelAlreadyExistsException;
 import org.apache.ignite.internal.network.handshake.CriticalHandshakeException;
 import org.apache.ignite.internal.network.handshake.HandshakeEventLoopSwitcher;
@@ -57,6 +59,7 @@ import org.apache.ignite.internal.network.recovery.message.HandshakeRejectedMess
 import org.apache.ignite.internal.network.recovery.message.HandshakeRejectionReason;
 import org.apache.ignite.internal.network.recovery.message.HandshakeStartMessage;
 import org.apache.ignite.internal.network.recovery.message.HandshakeStartResponseMessage;
+import org.apache.ignite.internal.network.recovery.message.HandshakeStartV2Message;
 import org.apache.ignite.internal.network.recovery.message.ProbeMessage;
 import org.apache.ignite.internal.version.IgniteProductVersionSource;
 import org.jetbrains.annotations.Nullable;
@@ -114,6 +117,14 @@ public class RecoveryInitiatorHandshakeManager implements HandshakeManager {
     /** Recovery descriptor. */
     private RecoveryDescriptor recoveryDescriptor;
 
+    private TopologyService topologyService;
+
+    private FailureProcessor failureProcessor;
+
+    private boolean versionedHandshake;
+
+    private HandshakeStartV2Message verifiedPeer;
+
     /**
      * Constructor.
      *
@@ -166,6 +177,14 @@ public class RecoveryInitiatorHandshakeManager implements HandshakeManager {
         }
     }
 
+    /** Enables negotiated topology exchange before this manager is attached to a channel. */
+    public RecoveryInitiatorHandshakeManager withStaleRecovery(TopologyService topology, FailureProcessor processor) {
+        assert ctx == null;
+        topologyService = topology;
+        failureProcessor = processor;
+        return this;
+    }
+
     /** {@inheritDoc} */
     @Override
     public void onInit(ChannelHandlerContext handlerContext) {
@@ -184,7 +203,8 @@ public class RecoveryInitiatorHandshakeManager implements HandshakeManager {
     }
 
     private void sendProbeToAcceptor() {
-        ProbeMessage probe = MESSAGE_FACTORY.probeMessage().build();
+        ProbeMessage probe = MESSAGE_FACTORY.probeMessage()
+                .dummy(topologyService == null ? 0 : HandshakeManagerUtils.TOPOLOGY_VERSION_CAPABILITY).build();
 
         toCompletableFuture(channel.writeAndFlush(new OutNetworkObject(probe, List.of()))).whenComplete((res, ex) -> {
             if (ex != null) {
@@ -257,8 +277,13 @@ public class RecoveryInitiatorHandshakeManager implements HandshakeManager {
     }
 
     private void onHandshakeStartMessage(HandshakeStartMessage handshakeStartMessage) {
+        versionedHandshake = topologyService != null && handshakeStartMessage instanceof HandshakeStartV2Message;
         if (possiblyRejectHandshakeStart(handshakeStartMessage)) {
             return;
+        }
+
+        if (versionedHandshake) {
+            verifiedPeer = (HandshakeStartV2Message) handshakeStartMessage;
         }
 
         this.remoteNode = handshakeStartMessage.serverNode().asClusterNode();
@@ -310,12 +335,6 @@ public class RecoveryInitiatorHandshakeManager implements HandshakeManager {
             return true;
         }
 
-        if (staleIdDetector.isIdStale(message.serverNode().id())) {
-            handleStaleAcceptorId(message);
-
-            return true;
-        }
-
         if (clusterIdMismatch(message.serverClusterId(), clusterIdSupplier.clusterId())) {
             handleClusterIdMismatch(message);
 
@@ -337,6 +356,11 @@ public class RecoveryInitiatorHandshakeManager implements HandshakeManager {
         if (stopping.getAsBoolean()) {
             handleRefusalToEstablishConnectionDueToStopping(message);
 
+            return true;
+        }
+
+        if (staleIdDetector.isIdStale(message.serverNode().id())) {
+            handleStaleAcceptorId(message);
             return true;
         }
 
@@ -370,6 +394,12 @@ public class RecoveryInitiatorHandshakeManager implements HandshakeManager {
         );
 
         sendRejectionMessageAndFailHandshake(message, HandshakeRejectionReason.STALE_LAUNCH_ID, HandshakeException::new);
+        // Require a known matching cluster as well as the negotiated wire type; a legacy peer cannot select an exit.
+        if (versionedHandshake && clusterIdSupplier.clusterId() != null
+                && clusterIdSupplier.clusterId().equals(msg.serverClusterId())) {
+            HandshakeManagerUtils.maybeFailOnStaleNodeDetection(failureProcessor, topologyService.logicalTopologyVersion(),
+                    ((HandshakeStartV2Message) msg).topologyVersion());
+        }
     }
 
     private void handleClusterIdMismatch(HandshakeStartMessage msg) {
@@ -423,6 +453,13 @@ public class RecoveryInitiatorHandshakeManager implements HandshakeManager {
     }
 
     private void onHandshakeRejectedMessage(HandshakeRejectedMessage msg) {
+        // A bare rejection carries no version and cannot select an exit. Only the peer identity and version
+        // already validated on THIS channel may be used, including in a one-sided stale-detection case.
+        if (msg.reason() == HandshakeRejectionReason.STALE_LAUNCH_ID && verifiedPeer != null && !stopping.getAsBoolean()
+                && clusterIdSupplier.clusterId() != null && clusterIdSupplier.clusterId().equals(verifiedPeer.serverClusterId())) {
+            HandshakeManagerUtils.maybeFailOnStaleNodeDetection(failureProcessor, topologyService.logicalTopologyVersion(),
+                    verifiedPeer.topologyVersion());
+        }
         if (!stopping.getAsBoolean() && msg.reason().logAsWarn()) {
             LOG.warn("Handshake rejected by acceptor: {}", msg.message());
         } else {
@@ -476,7 +513,15 @@ public class RecoveryInitiatorHandshakeManager implements HandshakeManager {
     private void handshake(RecoveryDescriptor descriptor) {
         PipelineUtils.afterHandshake(ctx.pipeline(), descriptor, createMessageHandler(), MESSAGE_FACTORY);
 
-        HandshakeStartResponseMessage response = MESSAGE_FACTORY.handshakeStartResponseMessage()
+        HandshakeStartResponseMessage response = versionedHandshake ? MESSAGE_FACTORY.handshakeStartResponseV2Message()
+                .clientNode(clusterNodeToMessage(localNode))
+                .receivedCount(descriptor.receivedCount())
+                .connectionId(connectionId)
+                .topologyVersion(topologyService.logicalTopologyVersion())
+                .clientClusterId(clusterIdSupplier.clusterId())
+                .productName(productVersionSource.productName())
+                .productVersion(productVersionSource.productVersion().toString())
+                .build() : MESSAGE_FACTORY.handshakeStartResponseMessage()
                 .clientNode(clusterNodeToMessage(localNode))
                 .receivedCount(descriptor.receivedCount())
                 .connectionId(connectionId)

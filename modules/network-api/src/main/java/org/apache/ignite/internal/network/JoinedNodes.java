@@ -21,6 +21,10 @@ package org.apache.ignite.internal.network;
  * Allows reacting to logical topology changes.
  */
 public interface JoinedNodes {
+    /** Publishes a committed CMG logical topology version (including topology leaps). */
+    default void onLogicalTopologyVersion(long version) {
+        // Optional for listeners that only track membership.
+    }
 
     /**
      * Called when the node joins logical topology.

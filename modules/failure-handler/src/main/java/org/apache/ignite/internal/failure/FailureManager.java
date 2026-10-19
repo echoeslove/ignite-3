@@ -80,6 +80,24 @@ public class FailureManager implements FailureProcessor, IgniteComponent {
     /** Failure context. */
     private volatile FailureContext failureCtx;
 
+    private StaleNodeRecovery staleNodeRecovery;
+
+    /** Installs explicit process recovery; embedded deployments should leave this disabled. */
+    public FailureManager withStaleNodeRecovery(StaleNodeRecovery recovery) {
+        staleNodeRecovery = recovery;
+        return this;
+    }
+
+    /** Arbitrates process recovery against an in-process restart before replacement construction. */
+    public boolean prepareForRestart() {
+        return staleNodeRecovery == null || staleNodeRecovery.prepareForRestart();
+    }
+
+    /** Whether stale recovery owns the process exit, including while initialization is being stopped. */
+    public boolean ownsProcessExit() {
+        return staleNodeRecovery != null && staleNodeRecovery.ownsProcessExit();
+    }
+
     /** Reserve buffer, which can be dropped to handle {@link OutOfMemoryError}. */
     private volatile byte @Nullable [] reserveBuf;
 
@@ -130,6 +148,9 @@ public class FailureManager implements FailureProcessor, IgniteComponent {
 
     @Override
     public CompletableFuture<Void> stopAsync(ComponentContext componentContext) {
+        if (staleNodeRecovery != null) {
+            staleNodeRecovery.close();
+        }
         if (configuration != null) {
             configuration.stopListen(configurationListener);
         }
@@ -206,6 +227,13 @@ public class FailureManager implements FailureProcessor, IgniteComponent {
             ThreadUtils.dumpThreads(LOG, ctxId, !handler.ignoredFailureTypes().contains(failureCtx.type()));
         }
 
+        boolean staleRecovery = staleNodeRecovery != null && failureCtx.error() instanceof StaleNodeFailureException;
+        if (staleRecovery) {
+            LOG.warn("Using opt-in version-selected stale-node recovery instead of the configured generic failure handler");
+            staleNodeRecovery.request();
+            // Scheduling can still be denied by the durable budget. Do not suppress subsequent ordinary critical failures.
+            return false;
+        }
         boolean invalidated = handler.onFailure(failureCtx);
 
         if (invalidated) {

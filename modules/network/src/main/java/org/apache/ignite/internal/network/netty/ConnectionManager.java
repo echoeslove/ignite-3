@@ -46,6 +46,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import org.apache.ignite.internal.failure.FailureProcessor;
 import org.apache.ignite.internal.future.OrderingFuture;
 import org.apache.ignite.internal.lang.IgniteInternalException;
 import org.apache.ignite.internal.lang.NodeStoppingException;
@@ -58,6 +59,7 @@ import org.apache.ignite.internal.network.InternalClusterNode;
 import org.apache.ignite.internal.network.NettyBootstrapFactory;
 import org.apache.ignite.internal.network.NetworkMessagesFactory;
 import org.apache.ignite.internal.network.RecipientLeftException;
+import org.apache.ignite.internal.network.TopologyService;
 import org.apache.ignite.internal.network.configuration.NetworkView;
 import org.apache.ignite.internal.network.configuration.SslConfigurationSchema;
 import org.apache.ignite.internal.network.configuration.SslView;
@@ -147,6 +149,20 @@ public class ConnectionManager implements ChannelCreationListener {
     private final ChannelTypeRegistry channelTypeRegistry;
 
     private final IgniteProductVersionSource productVersionSource;
+
+    private TopologyService topologyService;
+
+    private FailureProcessor failureProcessor;
+
+    /** Installs the topology/failure dependencies before starting the connection manager. */
+    public ConnectionManager withStaleRecovery(TopologyService topology, FailureProcessor processor) {
+        if (started.get()) {
+            throw new IllegalStateException("Connection manager already started");
+        }
+        topologyService = topology;
+        failureProcessor = processor;
+        return this;
+    }
 
     /** {@code null} if SSL is not {@link SslConfigurationSchema#enabled}. */
     private final @Nullable SslContext clientSslContext;
@@ -526,7 +542,7 @@ public class ConnectionManager implements ChannelCreationListener {
         InternalClusterNode localNode = Objects.requireNonNull(localNodeFuture.getNow(null), "localNode not set");
 
         if (initiatorHandshakeManagerFactory == null) {
-            return new RecoveryInitiatorHandshakeManager(
+            RecoveryInitiatorHandshakeManager manager = new RecoveryInitiatorHandshakeManager(
                     localNode,
                     connectionId,
                     descriptorProvider,
@@ -537,6 +553,7 @@ public class ConnectionManager implements ChannelCreationListener {
                     stopping::get,
                     productVersionSource
             );
+            return topologyService == null ? manager : manager.withStaleRecovery(topologyService, failureProcessor);
         }
 
         return initiatorHandshakeManagerFactory.create(
@@ -550,7 +567,7 @@ public class ConnectionManager implements ChannelCreationListener {
         // Do not just use localNodeFuture.join() to make sure the wait is time-limited.
         waitForLocalNodeToBeSet();
 
-        return new RecoveryAcceptorHandshakeManager(
+        RecoveryAcceptorHandshakeManager manager = new RecoveryAcceptorHandshakeManager(
                 localNodeFuture.join(),
                 FACTORY,
                 descriptorProvider,
@@ -561,6 +578,7 @@ public class ConnectionManager implements ChannelCreationListener {
                 stopping::get,
                 productVersionSource
         );
+        return topologyService == null ? manager : manager.withStaleRecovery(topologyService, failureProcessor);
     }
 
     private void waitForLocalNodeToBeSet() {

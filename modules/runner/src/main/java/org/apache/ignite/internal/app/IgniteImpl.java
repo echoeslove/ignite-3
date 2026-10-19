@@ -590,6 +590,15 @@ public class IgniteImpl implements Ignite {
         FailureProcessorConfiguration failureProcessorConfiguration = nodeConfigRegistry.getConfiguration(
                 FailureProcessorExtensionConfiguration.KEY).failureHandler();
         failureManager = new FailureManager(node::shutdown, failureProcessorConfiguration);
+        if (Boolean.getBoolean("ignite.staleRecovery.enabled")) {
+            failureManager.withStaleNodeRecovery(new org.apache.ignite.internal.failure.StaleNodeRecovery(
+                    // Bind the stopper to THIS instance: an old callback must not shut down a replacement through the server facade.
+                    () -> stopAsync().join(), workDir.resolve("stale-recovery"),
+                    Integer.getInteger("ignite.staleRecovery.maxAttempts", 3),
+                    Long.getLong("ignite.staleRecovery.backoffMillis", 30_000L),
+                    Long.getLong("ignite.staleRecovery.stopTimeoutMillis", 30_000L),
+                    code -> Runtime.getRuntime().halt(code)));
+        }
 
         SystemLocalConfiguration systemConfiguration = nodeConfigRegistry.getConfiguration(SystemLocalExtensionConfiguration.KEY).system();
 
@@ -1357,11 +1366,18 @@ public class IgniteImpl implements Ignite {
             @Override
             public void onNodeJoined(LogicalNode joinedNode, LogicalTopologySnapshot newTopology) {
                 joinedNodes.onJoined(joinedNode);
+                joinedNodes.onLogicalTopologyVersion(newTopology.version());
             }
 
             @Override
             public void onNodeLeft(LogicalNode leftNode, LogicalTopologySnapshot newTopology) {
                 joinedNodes.onLeft(leftNode);
+                joinedNodes.onLogicalTopologyVersion(newTopology.version());
+            }
+
+            @Override
+            public void onTopologyLeap(LogicalTopologySnapshot newTopology) {
+                joinedNodes.onLogicalTopologyVersion(newTopology.version());
             }
         };
     }
@@ -1809,6 +1825,14 @@ public class IgniteImpl implements Ignite {
     @TestOnly
     public FailureManager failureProcessor() {
         return failureManager;
+    }
+
+    boolean prepareForRestart() {
+        return failureManager.prepareForRestart();
+    }
+
+    boolean staleRecoveryOwnsExit() {
+        return failureManager.ownsProcessExit();
     }
 
     @TestOnly

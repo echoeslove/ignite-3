@@ -299,6 +299,9 @@ public class IgniteServerImpl implements IgniteServer {
     private CompletableFuture<Void> doRestartAsync(IgniteImpl instance) {
         // TODO: IGNITE-23006 - limit the wait to acquire the write lock with a timeout.
         return attachmentLock.detachedAsync(() -> {
+            if (!instance.prepareForRestart()) {
+                return failedFuture(new NodeStoppingException("Stale recovery has committed to process exit"));
+            }
             synchronized (igniteChangeMutex) {
                 LOG.info("Setting Ignite ref to null as restart is initiated [name={}]", nodeName);
                 this.ignite = null;
@@ -309,6 +312,11 @@ public class IgniteServerImpl implements IgniteServer {
                     .thenCompose(unused -> doStartAsync())
                     .thenCompose(unused -> waitForInitAsync());
         });
+    }
+
+    boolean staleRecoveryOwnsExit() {
+        IgniteImpl instance = ignite;
+        return instance != null && instance.staleRecoveryOwnsExit();
     }
 
     @Override

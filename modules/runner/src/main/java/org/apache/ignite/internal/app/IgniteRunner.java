@@ -92,15 +92,20 @@ public class IgniteRunner implements Callable<IgniteServer> {
         Signal.handle(new Signal("INT"), handler);
         Signal.handle(new Signal("TERM"), handler);
 
+        awaitInitialization(server, shutdown, System::exit);
+    }
+
+    /** Keep ordinary startup failures at exit 1; a committed stale stop must reach its watchdog's restart exit instead. */
+    static void awaitInitialization(IgniteServer server, AtomicBoolean shutdown, java.util.function.IntConsumer exit) {
         try {
             server.waitForInitAsync().get();
         } catch (ExecutionException | InterruptedException e) {
-            if (!shutdown.get()) {
+            if (!shutdown.get() && !(server instanceof IgniteServerImpl && ((IgniteServerImpl) server).staleRecoveryOwnsExit())) {
                 System.out.println("Error when starting the node: " + e.getMessage());
 
                 e.printStackTrace(System.out);
 
-                System.exit(1);
+                exit.accept(1);
             }
         }
     }

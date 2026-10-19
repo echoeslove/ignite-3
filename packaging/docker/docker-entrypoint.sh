@@ -31,6 +31,10 @@ JAVA_MEMORY_OPTIONS="-Xmx${JVM_MAX_MEM} -Xms${JVM_MIN_MEM}"
 
 JAVA_GC_OPTIONS="-XX:+Use${JVM_GC} -XX:G1HeapRegionSize=${JVM_G1HeapRegionSize}"
 
+if [ "${IGNITE_STALE_RECOVERY_ENABLED:-false}" = 'true' ]; then
+  IGNITE3_EXTRA_JVM_ARGS="${IGNITE3_EXTRA_JVM_ARGS:-} -Dignite.staleRecovery.enabled=true"
+fi
+
 CMD="${JAVACMD} \
   ${COMMON_JAVA_OPTS} \
   ${LOGGING_JAVA_OPTS} \
@@ -39,4 +43,37 @@ CMD="${JAVACMD} \
   ${IGNITE3_EXTRA_JVM_ARGS} \
   ${CLASSPATH}"
 
-exec $CMD "$@"
+if [ "${IGNITE_STALE_RECOVERY_ENABLED:-false}" != 'true' ]; then
+  exec $CMD "$@"
+fi
+
+# Opt-in, single-node JVM only. Persist the SAME work mount, including stale-recovery/budget.v1.
+# Only the dedicated segmentation exit is restarted; all unrelated failures propagate unchanged.
+# The Java side reserves a durable budget and applies backoff BEFORE emitting exit code 75.
+recovery_child=''
+recovery_stopping=false
+trap 'recovery_stopping=true; if [ -n "$recovery_child" ]; then kill -TERM "$recovery_child" 2>/dev/null; fi' TERM INT
+while :; do
+  if [ "$recovery_stopping" = 'true' ]; then
+    exit 143
+  fi
+  $CMD "$@" &
+  recovery_child=$!
+  # Also cover a signal arriving between the loop check and publication of the child PID.
+  if [ "$recovery_stopping" = 'true' ]; then
+    kill -TERM "$recovery_child" 2>/dev/null
+    wait "$recovery_child" 2>/dev/null
+    exit 143
+  fi
+  wait "$recovery_child"
+  recovery_status=$?
+  if [ "$recovery_stopping" = 'true' ]; then
+    wait "$recovery_child" 2>/dev/null
+    exit 143
+  fi
+  recovery_child=''
+  if [ "$recovery_status" -ne 75 ]; then
+    exit "$recovery_status"
+  fi
+  echo 'STALE_RECOVERY_RELAUNCH: reusing the existing work directory'
+done

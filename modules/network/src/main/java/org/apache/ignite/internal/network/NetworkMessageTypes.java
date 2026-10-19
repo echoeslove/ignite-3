@@ -101,4 +101,10 @@ public class NetworkMessageTypes {
      * Type for {@link ProbeMessage}.
      */
     public static final short PROBE_MESSAGE = 12;
+
+    /** Capability-negotiated hotfix4 handshake. Never sent to a legacy 3.1 initiator. */
+    public static final short HANDSHAKE_START_V2 = 13;
+
+    /** Response to the capability-negotiated handshake. */
+    public static final short HANDSHAKE_START_RESPONSE_V2 = 14;
 }

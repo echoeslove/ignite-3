@@ -58,23 +58,30 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import org.apache.ignite.internal.configuration.testframework.ConfigurationExtension;
 import org.apache.ignite.internal.configuration.testframework.InjectConfiguration;
+import org.apache.ignite.internal.failure.FailureProcessor;
 import org.apache.ignite.internal.future.OrderingFuture;
 import org.apache.ignite.internal.lang.IgniteInternalException;
 import org.apache.ignite.internal.manager.ComponentContext;
 import org.apache.ignite.internal.network.ChannelType;
+import org.apache.ignite.internal.network.ClusterIdSupplier;
 import org.apache.ignite.internal.network.ClusterNodeImpl;
+import org.apache.ignite.internal.network.ConstantClusterIdSupplier;
 import org.apache.ignite.internal.network.NettyBootstrapFactory;
 import org.apache.ignite.internal.network.NetworkMessage;
 import org.apache.ignite.internal.network.NetworkMessagesFactory;
 import org.apache.ignite.internal.network.OutNetworkObject;
+import org.apache.ignite.internal.network.TopologyService;
 import org.apache.ignite.internal.network.configuration.NetworkConfiguration;
 import org.apache.ignite.internal.network.configuration.NetworkView;
 import org.apache.ignite.internal.network.handshake.HandshakeException;
 import org.apache.ignite.internal.network.messages.TestMessage;
 import org.apache.ignite.internal.network.messages.TestMessagesFactory;
 import org.apache.ignite.internal.network.recovery.AllIdsAreFresh;
+import org.apache.ignite.internal.network.recovery.InMemoryStaleIds;
+import org.apache.ignite.internal.network.recovery.StaleIdDetector;
 import org.apache.ignite.internal.network.recovery.message.HandshakeFinishMessage;
 import org.apache.ignite.internal.network.serialization.MessageSerializationRegistry;
 import org.apache.ignite.internal.network.serialization.SerializationService;
@@ -89,6 +96,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 /**
  * Tests for {@link ConnectionManager}.
@@ -544,6 +553,16 @@ public class ItConnectionManagerTest extends BaseIgniteAbstractTest {
      * @return Connection manager.
      */
     private ConnectionManagerWrapper startManager(int port, UUID launchId, MessageSerializationRegistry registry) {
+        return startManager(port, launchId, registry, ignored -> {});
+    }
+
+    private ConnectionManagerWrapper startManager(int port, UUID launchId, MessageSerializationRegistry registry,
+            Consumer<ConnectionManager> initializer) {
+        return startManager(port, launchId, registry, initializer, new AllIdsAreFresh(), withoutClusterId());
+    }
+
+    private ConnectionManagerWrapper startManager(int port, UUID launchId, MessageSerializationRegistry registry,
+            Consumer<ConnectionManager> initializer, StaleIdDetector staleIds, ClusterIdSupplier clusterIds) {
         String consistentId = testNodeName(testInfo, port);
 
         networkConfiguration.port().update(port).join();
@@ -561,12 +580,13 @@ public class ItConnectionManagerTest extends BaseIgniteAbstractTest {
                     consistentId,
                     launchId,
                     bootstrapFactory,
-                    new AllIdsAreFresh(),
-                    withoutClusterId(),
+                    staleIds,
+                    clusterIds,
                     defaultChannelTypeRegistry(),
                     new DefaultIgniteProductVersionSource()
             );
 
+            initializer.accept(manager);
             manager.start();
             manager.setLocalNode(new ClusterNodeImpl(
                     launchId,
@@ -583,6 +603,94 @@ public class ItConnectionManagerTest extends BaseIgniteAbstractTest {
             assertThat(bootstrapFactory.stopAsync(new ComponentContext()), willCompleteSuccessfully());
 
             throw e;
+        }
+    }
+
+    /** Real TCP/serialization in all mixed-version directions; the legacy registry rejects V2 message types. */
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void negotiatedHandshakeSupportsLegacyAndReconnection(boolean initiatorPatched, boolean acceptorPatched) throws Exception {
+        TopologyService topology = mock(TopologyService.class);
+        when(topology.logicalTopologyVersion()).thenReturn(5L);
+        FailureProcessor failures = mock(FailureProcessor.class);
+        Consumer<ConnectionManager> patched = manager -> manager.withStaleRecovery(topology, failures);
+        Consumer<ConnectionManager> legacy = ignored -> {};
+
+        try (ConnectionManagerWrapper first = startManager(19370, UUID.randomUUID(),
+                compatibilityRegistry(initiatorPatched), initiatorPatched ? patched : legacy);
+                ConnectionManagerWrapper second = startManager(19371, UUID.randomUUID(),
+                        compatibilityRegistry(acceptorPatched), acceptorPatched ? patched : legacy)) {
+            for (int round = 0; round < 2; round++) {
+                CompletableFuture<NetworkMessage> received = new CompletableFuture<>();
+                second.connectionManager.addListener(object -> received.complete(object.message()));
+                NettySender sender = first.openChannelTo(second).get(10, TimeUnit.SECONDS);
+                String payload = "mixed-wire-round-" + round;
+                sender.send(new OutNetworkObject(messageFactory.testMessage().msg(payload).build(), emptyList()))
+                        .get(10, TimeUnit.SECONDS);
+                assertEquals(payload, ((TestMessage) received.get(10, TimeUnit.SECONDS)).msg());
+                if (round == 0) {
+                    sender.channel().close().sync();
+                    // Closed senders may remain cached until the next channel() call; an empty cache is not the contract.
+                    assertTrue(waitForCondition(() -> second.channels().values().stream()
+                            .noneMatch(value -> value.channel().isOpen()), 10_000));
+                }
+            }
+            org.mockito.Mockito.verifyNoInteractions(failures);
+        }
+    }
+
+    private static MessageSerializationRegistry compatibilityRegistry(boolean patched) {
+        MessageSerializationRegistry actual = defaultSerializationRegistry();
+        if (patched) {
+            return actual;
+        }
+        MessageSerializationRegistry legacy = mock(MessageSerializationRegistry.class);
+        when(legacy.createSerializer(anyShort(), anyShort())).thenAnswer(call -> {
+            short group = call.getArgument(0);
+            short type = call.getArgument(1);
+            if (group == 1 && (type == 13 || type == 14)) {
+                throw new IllegalStateException("Legacy serializer cannot encode a V2 handshake");
+            }
+            return actual.createSerializer(group, type);
+        });
+        when(legacy.createDeserializer(anyShort(), anyShort())).thenAnswer(call -> {
+            short group = call.getArgument(0);
+            short type = call.getArgument(1);
+            if (group == 1 && (type == 13 || type == 14)) {
+                throw new IllegalStateException("Legacy decoder cannot decode a V2 handshake");
+            }
+            return actual.createDeserializer(group, type);
+        });
+        return legacy;
+    }
+
+    /** Injects one-sided or mutual stale views over real TCP; only the CMG-version-lagging endpoint may invalidate itself. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void staleConflictSelectsLaggingNodeOverTcp(boolean mutualStaleness) throws Exception {
+        UUID lagId = UUID.randomUUID();
+        UUID aheadId = UUID.randomUUID();
+        var lagStale = new InMemoryStaleIds();
+        var aheadStale = new InMemoryStaleIds();
+        aheadStale.markAsStale(lagId);
+        if (mutualStaleness) {
+            lagStale.markAsStale(aheadId);
+        }
+        var clusterIds = new ConstantClusterIdSupplier(UUID.randomUUID());
+        TopologyService lagTopology = mock(TopologyService.class);
+        TopologyService aheadTopology = mock(TopologyService.class);
+        when(lagTopology.logicalTopologyVersion()).thenReturn(5L);
+        when(aheadTopology.logicalTopologyVersion()).thenReturn(6L);
+        var invalidated = new CompletableFuture<org.apache.ignite.internal.failure.FailureContext>();
+        FailureProcessor aheadFailures = mock(FailureProcessor.class);
+        try (ConnectionManagerWrapper lag = startManager(19372, lagId, defaultSerializationRegistry(),
+                manager -> manager.withStaleRecovery(lagTopology, context -> invalidated.complete(context)), lagStale, clusterIds);
+                ConnectionManagerWrapper ahead = startManager(19373, aheadId, defaultSerializationRegistry(),
+                        manager -> manager.withStaleRecovery(aheadTopology, aheadFailures), aheadStale, clusterIds)) {
+            assertThrows(ExecutionException.class, () -> lag.openChannelTo(ahead).get(10, TimeUnit.SECONDS), null);
+            assertTrue(invalidated.get(10, TimeUnit.SECONDS).error()
+                    instanceof org.apache.ignite.internal.failure.StaleNodeFailureException);
+            org.mockito.Mockito.verifyNoInteractions(aheadFailures);
         }
     }
 

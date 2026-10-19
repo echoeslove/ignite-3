@@ -26,6 +26,12 @@ import org.jetbrains.annotations.Nullable;
  */
 // TODO: allow removing event handlers, see https://issues.apache.org/jira/browse/IGNITE-14519
 public interface TopologyService extends ClusterNodeResolver, JoinedNodes {
+
+    /** Latest locally applied CMG topology version; zero means unknown, not a restart decision. */
+    default long logicalTopologyVersion() {
+        return 0;
+    }
+
     /**
      * Returns information about the current node.
      *

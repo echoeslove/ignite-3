@@ -23,6 +23,10 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
+import org.apache.ignite.internal.failure.FailureContext;
+import org.apache.ignite.internal.failure.FailureProcessor;
+import org.apache.ignite.internal.failure.FailureType;
+import org.apache.ignite.internal.failure.StaleNodeFailureException;
 import org.apache.ignite.internal.logger.IgniteLogger;
 import org.apache.ignite.internal.logger.Loggers;
 import org.apache.ignite.internal.network.InternalClusterNode;
@@ -37,6 +41,18 @@ import org.apache.ignite.internal.network.recovery.message.HandshakeRejectedMess
 import org.apache.ignite.internal.network.recovery.message.HandshakeRejectionReason;
 
 class HandshakeManagerUtils {
+    /** Advertised only in the existing one-byte probe. Legacy 3.1 acceptors ignore this byte. */
+    static final byte TOPOLOGY_VERSION_CAPABILITY = 72;
+
+    static void maybeFailOnStaleNodeDetection(FailureProcessor processor, long localVersion, long remoteVersion) {
+        // Unknown, equal and ahead are deliberately non-actionable. Never restart merely on a stale rejection.
+        if (processor != null && localVersion > 0 && remoteVersion > localVersion) {
+            String message = "Cluster segmentation detected: local CMG topology version " + localVersion
+                    + " is behind peer version " + remoteVersion;
+            processor.process(new FailureContext(FailureType.CRITICAL_ERROR, new StaleNodeFailureException(message), message));
+        }
+    }
+
     private static final IgniteLogger LOG = Loggers.forClass(HandshakeManagerUtils.class);
 
     private static final NetworkMessagesFactory MESSAGE_FACTORY = new NetworkMessagesFactory();
@@ -88,7 +104,7 @@ class HandshakeManagerUtils {
     }
 
     static Exception createExceptionFromRejectionMessage(HandshakeRejectedMessage msg) {
-        return msg.reason() == HandshakeRejectionReason.STOPPING
+        return msg.reason() == HandshakeRejectionReason.STOPPING || msg.reason() == HandshakeRejectionReason.STALE_LAUNCH_ID
                 ? new RecipientLeftException(msg.message())
                 : new HandshakeException(msg.message());
     }
