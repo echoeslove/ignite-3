@@ -20,6 +20,7 @@ apply from: "$rootDir/buildscripts/publishing.gradle"
 apply from: "$rootDir/buildscripts/java-junit5.gradle"
 apply from: "$rootDir/buildscripts/java-test-fixtures.gradle"
 apply from: "$rootDir/buildscripts/java-integration-test.gradle"
+apply from: "$rootDir/buildscripts/jmh.gradle"
 
 dependencies {
     implementation project(':ignite-api')
@@ -48,7 +49,12 @@ dependencies {
     testFixturesImplementation project(':ignite-api')
     testFixturesImplementation project(':ignite-core')
     testFixturesImplementation project(':ignite-failure-handler')
+    testFixturesImplementation project(':ignite-file-io')
+    testFixturesImplementation project(':ignite-configuration')
     testFixturesImplementation testFixtures(project(':ignite-core'))
+    testFixturesImplementation testFixtures(project(':ignite-configuration'))
+    testFixturesImplementation testFixtures(project(':ignite-metrics'))
+    testFixturesImplementation testFixtures(project(':ignite-failure-handler'))
     testFixturesImplementation libs.fastutil.core
     testFixturesImplementation libs.auto.service.annotations
 
@@ -61,3 +67,8 @@ dependencies {
 }
 
 description = 'ignite-page-memory'
+
+// Open GridUnsafe access in this module's forked benchmarks without changing other modules' JMH configuration.
+jmh {
+    jvmArgsAppend = rootProject.addOpens
+}

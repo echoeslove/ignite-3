@@ -23,6 +23,7 @@ import static org.apache.ignite.internal.pagememory.persistence.PageHeader.UNKNO
 import static org.apache.ignite.internal.pagememory.persistence.PageHeader.acquirePage;
 import static org.apache.ignite.internal.pagememory.persistence.PageHeader.dirty;
 import static org.apache.ignite.internal.pagememory.persistence.PageHeader.fullPageId;
+import static org.apache.ignite.internal.pagememory.persistence.PageHeader.headerIsValid;
 import static org.apache.ignite.internal.pagememory.persistence.PageHeader.initNew;
 import static org.apache.ignite.internal.pagememory.persistence.PageHeader.isAcquired;
 import static org.apache.ignite.internal.pagememory.persistence.PageHeader.partitionGeneration;
@@ -110,6 +111,21 @@ public class PageHeaderTest {
     }
 
     @Test
+    void testHeaderValidityPreservesDirtyFlag() {
+        assertFalse(headerIsValid(pageHeaderAddr));
+        dirty(pageHeaderAddr, true);
+        headerIsValid(pageHeaderAddr, true);
+        assertTrue(headerIsValid(pageHeaderAddr));
+        assertTrue(dirty(pageHeaderAddr));
+
+        dirty(pageHeaderAddr, false);
+        assertTrue(headerIsValid(pageHeaderAddr));
+        headerIsValid(pageHeaderAddr, false);
+        assertFalse(headerIsValid(pageHeaderAddr));
+        assertFalse(dirty(pageHeaderAddr));
+    }
+
+    @Test
     void testReadWriteFullPageId() {
         fullPageId(pageHeaderAddr, new FullPageId(4, 2));
         assertEquals(new FullPageId(4, 2), fullPageId(pageHeaderAddr));
@@ -117,8 +133,13 @@ public class PageHeaderTest {
 
     @Test
     void testAcquireRelease() {
-        assertEquals(1, acquirePage(pageHeaderAddr));
+        assertEquals(0, acquirePage(pageHeaderAddr));
         assertEquals(1, pinCount(pageHeaderAddr));
+        assertTrue(isAcquired(pageHeaderAddr));
+
+        assertEquals(1, acquirePage(pageHeaderAddr));
+        assertEquals(2, pinCount(pageHeaderAddr));
+        assertEquals(1, releasePage(pageHeaderAddr));
         assertTrue(isAcquired(pageHeaderAddr));
 
         assertEquals(0, releasePage(pageHeaderAddr));
