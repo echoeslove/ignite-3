@@ -139,7 +139,7 @@ public class ZonePartitionRaftListener implements RaftGroupListener {
                 .addHandler(
                         PartitionReplicationMessageGroup.GROUP_TYPE,
                         Commands.WRITE_INTENT_SWITCH_V2,
-                        new WriteIntentSwitchCommandHandler(tableProcessors::get, txManager))
+                        new WriteIntentSwitchCommandHandler(tableProcessors::get, txManager, txStatePartitionStorage))
                 .addHandler(
                         TxMessageGroup.GROUP_TYPE,
                         VACUUM_TX_STATE_COMMAND,
@@ -208,6 +208,10 @@ public class ZonePartitionRaftListener implements RaftGroupListener {
                     );
                 } else if (command instanceof UpdateMinimumActiveTxBeginTimeCommand) {
                     result = processCrossTableProcessorsCommand(command, commandIndex, commandTerm, safeTimestamp);
+                    // The enclosing state lock keeps this check consistent with the processor iteration above.
+                    if (tableProcessors.isEmpty()) {
+                        updateTxStateStorageLastAppliedIfNotStale(commandIndex, commandTerm);
+                    }
                 } else if (command instanceof SafeTimeSyncCommand) {
                     result = handleSafeTimeSyncCommand(commandIndex, commandTerm);
                 } else if (command instanceof PrimaryReplicaChangeCommand) {
@@ -223,6 +227,8 @@ public class ZonePartitionRaftListener implements RaftGroupListener {
 
                     if (commandHandler == null) {
                         LOG.info("Message type {} is not supported by the zone partition RAFT listener yet", command.getClass());
+
+                        updateTxStateStorageLastAppliedIfNotStale(commandIndex, commandTerm);
 
                         result = EMPTY_APPLIED_RESULT;
                     } else {
@@ -315,10 +321,18 @@ public class ZonePartitionRaftListener implements RaftGroupListener {
             LOG.warn("Table processor for table ID {} not found. Command will be ignored: {}",
                     tableId, command.toStringForLightLogging());
 
+            updateTxStateStorageLastAppliedIfNotStale(commandIndex, commandTerm);
+
             return EMPTY_APPLIED_RESULT;
         }
 
         return tableProcessor.processCommand(command, commandIndex, commandTerm, safeTimestamp);
+    }
+
+    private void updateTxStateStorageLastAppliedIfNotStale(long commandIndex, long commandTerm) {
+        if (commandIndex > txStateStorage.lastAppliedIndex()) {
+            txStateStorage.lastApplied(commandIndex, commandTerm);
+        }
     }
 
     private boolean updateLeaseInfoInTxStorage(PrimaryReplicaChangeCommand command, long commandIndex, long commandTerm) {
@@ -350,7 +364,7 @@ public class ZonePartitionRaftListener implements RaftGroupListener {
 
         // We MUST bump information about last updated index+term in one underlying storage.
         // See the comment in processWriteCommand for explanation.
-        txStateStorage.lastApplied(commandIndex, commandTerm);
+        updateTxStateStorageLastAppliedIfNotStale(commandIndex, commandTerm);
 
         return EMPTY_APPLIED_RESULT;
     }

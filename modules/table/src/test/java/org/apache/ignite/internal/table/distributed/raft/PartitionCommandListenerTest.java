@@ -29,8 +29,10 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -39,6 +41,7 @@ import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -46,6 +49,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.io.Serializable;
@@ -90,8 +94,10 @@ import org.apache.ignite.internal.partition.replicator.network.command.TimedBina
 import org.apache.ignite.internal.partition.replicator.network.command.UpdateAllCommand;
 import org.apache.ignite.internal.partition.replicator.network.command.UpdateCommand;
 import org.apache.ignite.internal.partition.replicator.network.command.UpdateCommandV2;
+import org.apache.ignite.internal.partition.replicator.network.command.UpdateMinimumActiveTxBeginTimeCommand;
 import org.apache.ignite.internal.partition.replicator.network.command.WriteIntentSwitchCommand;
 import org.apache.ignite.internal.partition.replicator.network.replication.BinaryRowMessage;
+import org.apache.ignite.internal.partition.replicator.raft.CommandResult;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.PartitionDataStorage;
 import org.apache.ignite.internal.placementdriver.LeasePlacementDriver;
 import org.apache.ignite.internal.raft.Command;
@@ -131,6 +137,7 @@ import org.apache.ignite.internal.table.distributed.index.IndexMetaStorage;
 import org.apache.ignite.internal.table.distributed.index.IndexUpdateHandler;
 import org.apache.ignite.internal.table.distributed.index.MetaIndexStatus;
 import org.apache.ignite.internal.table.distributed.index.MetaIndexStatusChange;
+import org.apache.ignite.internal.table.distributed.storage.BrokenTxStatePartitionStorage;
 import org.apache.ignite.internal.table.impl.DummyInternalTableImpl;
 import org.apache.ignite.internal.table.impl.DummySchemaManagerImpl;
 import org.apache.ignite.internal.testframework.BaseIgniteAbstractTest;
@@ -155,6 +162,9 @@ import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Captor;
 import org.mockito.InOrder;
@@ -652,6 +662,94 @@ public class PartitionCommandListenerTest extends BaseIgniteAbstractTest {
 
         assertThat(txStatePartitionStorage.lastAppliedIndex(), is(3L));
         assertThat(txStatePartitionStorage.lastAppliedTerm(), is(2L));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void rejectedLeaseCommandsAdvanceIndexWithoutChangingData(boolean batch, boolean missingLease) {
+        if (missingLease) {
+            when(partitionDataStorage.leaseInfo()).thenReturn(null);
+        }
+        WriteCommand command = batch ? PARTITION_REPLICATION_MESSAGES_FACTORY.updateAllCommandV2()
+                .tableId(TABLE_ID).txId(TestTransactionIds.newTransactionId()).txCoordinatorId(UUID.randomUUID())
+                .commitPartitionId(toTablePartitionIdMessage(REPLICA_MESSAGES_FACTORY, new TablePartitionId(TABLE_ID, PARTITION_ID)))
+                .leaseStartTime(999L).messageRowsToUpdate(Map.of()).initiatorTime(hybridClock.now()).build()
+                : PARTITION_REPLICATION_MESSAGES_FACTORY.updateCommandV2()
+                        .tableId(TABLE_ID).rowUuid(UUID.randomUUID()).txId(TestTransactionIds.newTransactionId())
+                        .txCoordinatorId(UUID.randomUUID())
+                        .commitPartitionId(toTablePartitionIdMessage(
+                                REPLICA_MESSAGES_FACTORY, new TablePartitionId(TABLE_ID, PARTITION_ID)))
+                        .leaseStartTime(999L).initiatorTime(hybridClock.now()).build();
+
+        CommandResult result = commandListener.processCommand(command, 15, 2, hybridClock.now());
+
+        assertFalse(result.wasApplied());
+        assertFalse(((UpdateCommandResult) result.result()).isPrimaryReplicaMatch());
+        assertEquals(missingLease ? 0L : HybridTimestamp.MIN_VALUE.addPhysicalTime(1).longValue(),
+                ((UpdateCommandResult) result.result()).currentLeaseStartTime());
+        assertEquals(15, mvPartitionStorage.lastAppliedIndex());
+        assertEquals(2, mvPartitionStorage.lastAppliedTerm());
+        verifyNoInteractions(storageUpdateHandler);
+    }
+
+    @Test
+    void minimumActiveTxCommandAdvancesIndexBeforeFlush() {
+        UpdateMinimumActiveTxBeginTimeCommand command = PARTITION_REPLICATION_MESSAGES_FACTORY.updateMinimumActiveTxBeginTimeCommand()
+                .initiatorTime(hybridClock.now()).safeTime(hybridClock.now()).timestamp(hybridClock.now().longValue()).build();
+
+        commandListener.processCommand(command, 15, 2, hybridClock.now());
+
+        InOrder order = inOrder(partitionDataStorage);
+        order.verify(partitionDataStorage).lastApplied(15, 2);
+        order.verify(partitionDataStorage).flush(false);
+        assertEquals(15, mvPartitionStorage.lastAppliedIndex());
+        assertEquals(2, mvPartitionStorage.lastAppliedTerm());
+    }
+
+    @Test
+    void minimumActiveTxCommandDoesNotRegressIndexOrTerm() {
+        mvPartitionStorage.lastApplied(20, 3);
+        UpdateMinimumActiveTxBeginTimeCommand command = PARTITION_REPLICATION_MESSAGES_FACTORY.updateMinimumActiveTxBeginTimeCommand()
+                .initiatorTime(hybridClock.now()).safeTime(hybridClock.now()).timestamp(hybridClock.now().longValue()).build();
+
+        assertFalse(commandListener.processCommand(command, 15, 2, hybridClock.now()).wasApplied());
+
+        assertEquals(20, mvPartitionStorage.lastAppliedIndex());
+        assertEquals(3, mvPartitionStorage.lastAppliedTerm());
+        verify(partitionDataStorage, never()).flush(false);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1, 2})
+    @WithSystemProperty(key = COLOCATION_FEATURE_FLAG, value = "true")
+    void colocatedCommandInvariantNeverAccessesTableTxStorage(int kind) {
+        var forbiddenTxStorage = spy(new BrokenTxStatePartitionStorage());
+        var listener = new PartitionListener(
+                mock(TxManager.class), partitionDataStorage, storageUpdateHandler, forbiddenTxStorage,
+                safeTimeTracker, new PendingComparableValuesTracker<>(0L), catalogService, SCHEMA_REGISTRY,
+                indexMetaStorage, UUID.randomUUID(), mock(MinimumRequiredTimeCollectorService.class), mock(Executor.class),
+                mock(LeasePlacementDriver.class), mock(ClockService.class), new SystemPropertiesNodeProperties(),
+                new TablePartitionId(TABLE_ID, PARTITION_ID)
+        );
+
+        if (kind == 1) {
+            partitionDataStorage.lastApplied(20, 3);
+        } else if (kind == 2) {
+            // Force an invariant violation to check the diagnostic path as well as the successful paths.
+            doReturn(0L).when(partitionDataStorage).lastAppliedIndex();
+        }
+
+        WriteCommand command = PARTITION_REPLICATION_MESSAGES_FACTORY.updateMinimumActiveTxBeginTimeCommand()
+                .initiatorTime(hybridClock.now()).safeTime(hybridClock.now()).timestamp(hybridClock.now().longValue()).build();
+
+        if (kind == 2) {
+            assertThrows(AssertionError.class, () -> listener.processCommand(command, 15, 2, hybridClock.now()));
+        } else {
+            listener.processCommand(command, 15, 2, hybridClock.now());
+            assertEquals(kind == 1 ? 20L : 15L, partitionDataStorage.lastAppliedIndex());
+        }
+
+        verifyNoInteractions(forbiddenTxStorage);
     }
 
     @Test

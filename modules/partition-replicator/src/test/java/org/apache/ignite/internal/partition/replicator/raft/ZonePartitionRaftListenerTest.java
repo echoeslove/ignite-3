@@ -90,6 +90,7 @@ import org.apache.ignite.internal.tx.TxManager;
 import org.apache.ignite.internal.tx.TxMeta;
 import org.apache.ignite.internal.tx.TxState;
 import org.apache.ignite.internal.tx.UpdateCommandResult;
+import org.apache.ignite.internal.tx.message.TxMessagesFactory;
 import org.apache.ignite.internal.tx.storage.state.TxStatePartitionStorage;
 import org.apache.ignite.internal.tx.storage.state.test.TestTxStatePartitionStorage;
 import org.apache.ignite.internal.tx.test.TestTransactionIds;
@@ -102,6 +103,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Captor;
 import org.mockito.Mock;
@@ -445,7 +448,11 @@ class ZonePartitionRaftListenerTest extends BaseIgniteAbstractTest {
         UpdateCommandV2 updateCommand = mock(UpdateCommandV2.class);
         when(updateCommand.tableId()).thenReturn(TABLE_ID);
 
-        WriteIntentSwitchCommand writeIntentSwitchCommand = mock(WriteIntentSwitchCommand.class);
+        WriteIntentSwitchCommand writeIntentSwitchCommand = PARTITION_REPLICATION_MESSAGES_FACTORY.writeIntentSwitchCommandV2()
+                .txId(TestTransactionIds.newTransactionId())
+                .initiatorTime(clock.now())
+                .tableIds(Set.of(TABLE_ID))
+                .build();
 
         SafeTimeSyncCommand safeTimeSyncCommand = mock(SafeTimeSyncCommand.class);
 
@@ -511,6 +518,101 @@ class ZonePartitionRaftListenerTest extends BaseIgniteAbstractTest {
 
         assertThat(txStatePartitionStorage.lastAppliedIndex(), is(3L));
         assertThat(txStatePartitionStorage.lastAppliedTerm(), is(2L));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1, 2, 3, 4, 5, 6, 7, 8})
+    void gapCommandsPersistIndexWithoutTableStorages(int kind) {
+        WriteCommand command = commandWithoutTableStorage(kind);
+
+        listener.onWrite(List.of(writeCommandClosure(15, 2, command, null, null)).iterator());
+
+        assertThat(txStatePartitionStorage.lastAppliedIndex(), is(15L));
+        assertThat(txStatePartitionStorage.lastAppliedTerm(), is(2L));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1, 2, 3, 4, 5, 6, 7, 8})
+    void gapCommandsDoNotRegressIndexWithoutTableStorages(int kind) {
+        txStatePartitionStorage.lastApplied(20, 3);
+        WriteCommand command = commandWithoutTableStorage(kind);
+
+        listener.onWrite(List.of(writeCommandClosure(15, 2, command, null, null)).iterator());
+
+        assertThat(txStatePartitionStorage.lastAppliedIndex(), is(20L));
+        assertThat(txStatePartitionStorage.lastAppliedTerm(), is(3L));
+        verify(txStatePartitionStorage, never()).lastApplied(15, 2);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void writeIntentSwitchWithExistingTableDoesNotAdvanceTxStorage(boolean includesMissingTable) {
+        var tableProcessor = new TestRaftTableProcessor();
+        listener.addTableProcessor(TABLE_ID, tableProcessor);
+
+        WriteIntentSwitchCommand command = PARTITION_REPLICATION_MESSAGES_FACTORY.writeIntentSwitchCommandV2()
+                .txId(TestTransactionIds.newTransactionId())
+                .initiatorTime(clock.now())
+                .tableIds(includesMissingTable ? Set.of(TABLE_ID, 999) : Set.of(TABLE_ID))
+                .build();
+
+        listener.onWrite(List.of(writeCommandClosure(15, 2, command, null, null)).iterator());
+
+        assertThat(tableProcessor.lastAppliedIndex(), is(15L));
+        assertThat(tableProcessor.lastAppliedTerm(), is(2L));
+        assertThat(txStatePartitionStorage.lastAppliedIndex(), is(0L));
+        verify(txStatePartitionStorage, never()).lastApplied(anyLong(), anyLong());
+    }
+
+    @Test
+    void minimumActiveTxCommandWithExistingTableDoesNotAdvanceTxStorage() {
+        var tableProcessor = new TestRaftTableProcessor();
+        listener.addTableProcessor(TABLE_ID, tableProcessor);
+
+        WriteCommand command = PARTITION_REPLICATION_MESSAGES_FACTORY.updateMinimumActiveTxBeginTimeCommand()
+                .initiatorTime(clock.now()).safeTime(clock.now()).timestamp(clock.now().longValue()).build();
+
+        listener.onWrite(List.of(writeCommandClosure(15, 2, command, null, null)).iterator());
+
+        assertThat(tableProcessor.lastAppliedIndex(), is(15L));
+        assertThat(tableProcessor.lastAppliedTerm(), is(2L));
+        assertThat(txStatePartitionStorage.lastAppliedIndex(), is(0L));
+        verify(txStatePartitionStorage, never()).lastApplied(anyLong(), anyLong());
+    }
+
+    private WriteCommand commandWithoutTableStorage(int kind) {
+        switch (kind) {
+            case 0:
+                UpdateCommandV2 update = mock(UpdateCommandV2.class);
+                when(update.tableId()).thenReturn(999);
+                return update;
+            case 1:
+                return PARTITION_REPLICATION_MESSAGES_FACTORY.updateMinimumActiveTxBeginTimeCommand()
+                        .initiatorTime(clock.now()).safeTime(clock.now()).timestamp(clock.now().longValue()).build();
+            case 2:
+            case 3:
+                return PARTITION_REPLICATION_MESSAGES_FACTORY.writeIntentSwitchCommandV2()
+                        .txId(TestTransactionIds.newTransactionId()).initiatorTime(clock.now())
+                        .tableIds(kind == 2 ? Set.of() : Set.of(999)).build();
+            case 4:
+                WriteCommand unsupported = mock(WriteCommand.class);
+                when(unsupported.groupType()).thenReturn((short) 99);
+                when(unsupported.messageType()).thenReturn((short) 99);
+                return unsupported;
+            case 5:
+                return REPLICA_MESSAGES_FACTORY.primaryReplicaChangeCommand()
+                        .primaryReplicaNodeName("primary").primaryReplicaNodeId(randomUUID())
+                        .leaseStartTime(clock.now().longValue()).build();
+            case 6:
+                return REPLICA_MESSAGES_FACTORY.safeTimeSyncCommand().initiatorTime(clock.now()).safeTime(clock.now()).build();
+            case 7:
+                return PARTITION_REPLICATION_MESSAGES_FACTORY.finishTxCommandV2()
+                        .txId(TestTransactionIds.newTransactionId()).initiatorTime(clock.now()).partitions(List.of()).build();
+            case 8:
+                return new TxMessagesFactory().vacuumTxStatesCommand().txIds(Set.of(randomUUID())).build();
+            default:
+                throw new AssertionError(kind);
+        }
     }
 
     @Test

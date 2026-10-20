@@ -77,6 +77,13 @@ public class MinimumActiveTxTimeCommandHandler extends AbstractCommandHandler<Up
 
         long timestamp = command.timestamp();
 
+        // Persist the processed Raft position before flushing, including for a command with no row changes.
+        storage.runConsistently(locker -> {
+            storage.lastApplied(commandIndex, commandTerm);
+
+            return null;
+        });
+
         storage.flush(false)
                 .whenComplete((r, t) -> {
                     if (t == null) {

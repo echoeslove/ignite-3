@@ -386,6 +386,14 @@ public class PartitionListener implements RaftGroupListener, RaftTableProcessor 
             throw new AssertionError("Unknown command type [command=" + command.toStringForLightLogging() + ']');
         }
 
+        // Non-colocated 3.1 listeners also handle TX commands; colocated table processors must never access table TX storage.
+        assert storage.lastAppliedIndex() >= commandIndex
+                || (!nodeProperties.colocationEnabled() && txStatePartitionStorage.lastAppliedIndex() >= commandIndex) : String.format(
+                "Last applied index after command processing is less than the command index "
+                        + "[mvAppliedIndex=%d, commandIndex=%d, command=%s]",
+                storage.lastAppliedIndex(), commandIndex, command.toStringForLightLogging()
+        );
+
         if (result.wasApplied()) {
             // Adjust safe time before completing update to reduce waiting.
             if (safeTimestamp != null && safeTimeTracker != null) {
@@ -468,6 +476,9 @@ public class PartitionListener implements RaftGroupListener, RaftTableProcessor 
             long leaseStartTime = cmd.leaseStartTime();
 
             if (storageLeaseInfo == null || leaseStartTime != storageLeaseInfo.leaseStartTime()) {
+                // Rejected business updates are still processed Raft entries and must be covered by the next snapshot.
+                advanceLastAppliedIndexConsistently(commandIndex, commandTerm);
+
                 var updateCommandResult = new UpdateCommandResult(
                         false,
                         storageLeaseInfo == null ? 0 : storageLeaseInfo.leaseStartTime(),
@@ -540,6 +551,9 @@ public class PartitionListener implements RaftGroupListener, RaftTableProcessor 
             long leaseStartTime = cmd.leaseStartTime();
 
             if (storageLeaseInfo == null || leaseStartTime != storageLeaseInfo.leaseStartTime()) {
+                // Rejected business updates are still processed Raft entries and must be covered by the next snapshot.
+                advanceLastAppliedIndexConsistently(commandIndex, commandTerm);
+
                 var updateCommandResult = new UpdateCommandResult(
                         false,
                         storageLeaseInfo == null ? 0 : storageLeaseInfo.leaseStartTime(),
