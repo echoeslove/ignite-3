@@ -17,6 +17,7 @@
 
 package org.apache.ignite.internal.lowwatermark;
 
+import static java.util.concurrent.CompletableFuture.failedFuture;
 import static org.apache.ignite.configuration.notifications.ConfigurationListener.fromConsumer;
 import static org.apache.ignite.internal.failure.FailureType.CRITICAL_ERROR;
 import static org.apache.ignite.internal.hlc.HybridTimestamp.MIN_VALUE;
@@ -27,7 +28,11 @@ import static org.apache.ignite.internal.util.ExceptionUtils.hasCause;
 import static org.apache.ignite.internal.util.IgniteUtils.inBusyLock;
 import static org.apache.ignite.internal.util.IgniteUtils.inBusyLockAsync;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -128,6 +133,18 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
 
     private final Map<UUID, LowWatermarkLock> locks = new ConcurrentHashMap<>();
 
+    /** Guards completion progress, which can lag the published value while listeners are running. */
+    private final Object completionLock = new Object();
+
+    /** Guarded by {@link #completionLock}. */
+    private HybridTimestamp completedLowWatermark = MIN_VALUE;
+
+    /** Guarded by {@link #completionLock}. */
+    private final NavigableMap<HybridTimestamp, CompletableFuture<Void>> completionWaiters = new TreeMap<>();
+
+    /** Guarded by {@link #completionLock}. */
+    private @Nullable Throwable updateFailure;
+
     /** Guarded by {@link #scheduleUpdateLowWatermarkTaskLock}. */
     private @Nullable ScheduledUpdateLowWatermarkTask lastScheduledUpdateLowWatermarkTask;
 
@@ -195,6 +212,8 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
         }
 
         busyLock.block();
+
+        completeLowWatermarkUpdate(null, new NodeStoppingException());
 
         ScheduledFuture<?> lastScheduledTaskFuture = this.lastScheduledTaskFuture.get();
 
@@ -302,6 +321,8 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
             lowWatermark = newLowWatermark;
 
             saveWatermarkToVault(newLowWatermark);
+
+            completeLowWatermarkUpdate(newLowWatermark, null);
         } finally {
             updateLowWatermarkLock.writeLock().unlock();
         }
@@ -334,8 +355,7 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
             HybridTimestamp currentLowWatermark = lowWatermark;
 
             if (currentLowWatermark != null && currentLowWatermark.compareTo(newLowWatermark) >= 0) {
-                // Recovery may have restored a higher watermark before any candidate has been scheduled.
-                return lowWatermarkCandidate.get().updateFuture().copy();
+                return waitForLowWatermarkCompletion(newLowWatermark);
             }
 
             LowWatermarkCandidate newLowWatermarkCandidate = new LowWatermarkCandidate(newLowWatermark, new CompletableFuture<>());
@@ -346,7 +366,7 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
 
                 // If another candidate contains a higher low watermark, then there is no need to update.
                 if (oldLowWatermarkCandidate.lowWatermark().compareTo(newLowWatermark) >= 0) {
-                    return oldLowWatermarkCandidate.updateFuture().copy();
+                    return waitForLowWatermarkCompletion(newLowWatermark);
                 }
             } while (!lowWatermarkCandidate.compareAndSet(oldLowWatermarkCandidate, newLowWatermarkCandidate));
 
@@ -355,14 +375,59 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
                     .thenComposeAsync(unused -> updateAndNotify(newLowWatermark), scheduledThreadPool)
                     .whenComplete((unused, throwable) -> {
                         if (throwable != null) {
+                            // Also cover failures before updateAndNotify can install its completion handler (for example Vault I/O).
+                            completeLowWatermarkUpdate(null, throwable);
                             newLowWatermarkCandidate.updateFuture().completeExceptionally(throwable);
                         } else {
                             newLowWatermarkCandidate.updateFuture().complete(null);
                         }
                     });
 
-            return newLowWatermarkCandidate.updateFuture().copy();
+            return waitForLowWatermarkCompletion(newLowWatermark);
         });
+    }
+
+    private CompletableFuture<Void> waitForLowWatermarkCompletion(HybridTimestamp requested) {
+        synchronized (completionLock) {
+            if (completedLowWatermark.compareTo(requested) >= 0) {
+                return nullCompletedFuture();
+            }
+
+            if (updateFailure != null) {
+                return failedFuture(updateFailure);
+            }
+
+            return completionWaiters.computeIfAbsent(requested, unused -> new CompletableFuture<>()).copy();
+        }
+    }
+
+    private void completeLowWatermarkUpdate(@Nullable HybridTimestamp completed, @Nullable Throwable failure) {
+        List<CompletableFuture<Void>> waiters;
+
+        synchronized (completionLock) {
+            if (failure != null) {
+                updateFailure = failure;
+                waiters = new ArrayList<>(completionWaiters.values());
+                completionWaiters.clear();
+            } else {
+                assert completed != null;
+                if (completedLowWatermark.compareTo(completed) < 0) {
+                    completedLowWatermark = completed;
+                }
+                Map<HybridTimestamp, CompletableFuture<Void>> satisfied = completionWaiters.headMap(completedLowWatermark, true);
+                waiters = new ArrayList<>(satisfied.values());
+                satisfied.clear();
+            }
+        }
+
+        // User continuations may re-enter this component; never invoke them under completionLock.
+        for (CompletableFuture<Void> waiter : waiters) {
+            if (failure == null) {
+                waiter.complete(null);
+            } else {
+                waiter.completeExceptionally(failure);
+            }
+        }
     }
 
     @Override
@@ -406,6 +471,7 @@ public class LowWatermarkImpl extends AbstractEventProducer<LowWatermarkEvent, L
                                     LOW_WATERMARK_CHANGED,
                                     new ChangeLowWatermarkEventParameters(newLowWatermark)), scheduledThreadPool)
                             .whenCompleteAsync((unused, throwable) -> {
+                                completeLowWatermarkUpdate(throwable == null ? newLowWatermark : null, throwable);
                                 if (throwable != null) {
                                     if (!(hasCause(throwable, NodeStoppingException.class))) {
                                         LOG.error("Failed to update low watermark: {}", throwable, newLowWatermark);

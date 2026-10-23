@@ -716,7 +716,7 @@ public class PartitionReplicaLifecycleManager extends
                             // still in the rebalance state (and hence we'll repeat the destruction on the next start), or the Raft log
                             // destruction will be persisted (and we'll just recover normally).
                             try {
-                                replicaMgr.destroyReplicationProtocolStorages(zonePartitionId, isVolatileZone);
+                                replicaMgr.resetReplicationProtocolStoragesForSnapshot(zonePartitionId, isVolatileZone);
                             } catch (NodeStoppingException e) {
                                 return failedFuture(e);
                             }

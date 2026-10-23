@@ -611,6 +611,24 @@ public class JraftServerImpl implements RaftServer {
         destroyRaftNodeStoragesInternal(nodeId, groupOptions, false);
     }
 
+    /** Resets snapshot-installation storages without discarding the node's durable term and vote. */
+    public void resetRaftNodeStoragesForSnapshot(RaftNodeId nodeId, RaftGroupOptions groupOptions) {
+        synchronized (startNodeMonitor(nodeId)) {
+            try {
+                LogStorageFactory logStorageFactory = groupOptions.getLogStorageFactory();
+
+                if (logStorageFactory != null) {
+                    logStorageFactory.destroyLogStorage(nodeId.nodeIdStringForStorage());
+                }
+
+                // Never remove meta, even temporarily: a crash must not forget the current term or vote.
+                IgniteUtils.deleteIfExistsThrowable(serverDataPathForNodeId(nodeId, groupOptions).resolve("snapshot"));
+            } catch (Exception e) {
+                throw new IgniteInternalException(INTERNAL_ERR, "Failed to reset snapshot storage for node: " + nodeId, e);
+            }
+        }
+    }
+
     @Override
     public void destroyRaftNodeStoragesDurably(RaftNodeId nodeId, RaftGroupOptions groupOptions) {
         destroyRaftNodeStoragesInternal(nodeId, groupOptions, true);
@@ -632,6 +650,12 @@ public class JraftServerImpl implements RaftServer {
     }
 
     private void destroyRaftNodeStoragesInternal(RaftNodeId nodeId, RaftGroupOptions groupOptions, boolean durable) {
+        synchronized (startNodeMonitor(nodeId)) {
+            destroyRaftNodeStoragesUnderLock(nodeId, groupOptions, durable);
+        }
+    }
+
+    private void destroyRaftNodeStoragesUnderLock(RaftNodeId nodeId, RaftGroupOptions groupOptions, boolean durable) {
         StorageDestructionIntent intent = groupStoragesContextResolver.getIntent(nodeId, groupOptions.volatileStores());
 
         if (durable) {

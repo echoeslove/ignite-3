@@ -804,8 +804,7 @@ public class IncomingSnapshotCopier extends SnapshotCopier {
         try {
             LogStorageAccess logStorage = partitionSnapshotStorage.logStorage();
 
-            logStorage.destroy(key.replicationGroupId(), key.isVolatile());
-            logStorage.createMetaStorage(key.replicationGroupId());
+            logStorage.resetForSnapshot(key.replicationGroupId(), key.isVolatile());
         } catch (NodeStoppingException e) {
             throw new IgniteInternalException(NODE_STOPPING_ERR, e);
         }

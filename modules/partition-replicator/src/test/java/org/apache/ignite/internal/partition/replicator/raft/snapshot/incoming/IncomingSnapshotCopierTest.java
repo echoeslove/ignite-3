@@ -278,7 +278,9 @@ public class IncomingSnapshotCopierTest extends BaseIgniteAbstractTest {
 
         verify(incomingMvTableStorage).startRebalancePartition(PARTITION_ID);
         verify(incomingTxStatePartitionStorage).startRebalance();
-        verify(replicaManager).destroyReplicationProtocolStorages(any(), anyBoolean());
+        verify(replicaManager).resetReplicationProtocolStoragesForSnapshot(any(), anyBoolean());
+        verify(replicaManager, never()).destroyReplicationProtocolStorages(any(), anyBoolean());
+        verify(replicaManager, never()).createMetaStorage(any());
 
         var expSnapshotInfo = new PartitionSnapshotInfo(
                 expLastAppliedIndex,
@@ -604,7 +606,7 @@ public class IncomingSnapshotCopierTest extends BaseIgniteAbstractTest {
 
         verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID), never()).startRebalance();
         verify(partitionSnapshotStorage.partitionsByTableId().get(TABLE_ID), never()).abortRebalance();
-        verify(replicaManager, never()).destroyReplicationProtocolStorages(any(), anyBoolean());
+        verify(replicaManager, never()).resetReplicationProtocolStoragesForSnapshot(any(), anyBoolean());
     }
 
     @Test

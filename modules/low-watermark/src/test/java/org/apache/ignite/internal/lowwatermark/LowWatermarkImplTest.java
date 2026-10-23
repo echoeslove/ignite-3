@@ -45,6 +45,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.atMost;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -391,6 +392,136 @@ public class LowWatermarkImplTest extends BaseIgniteAbstractTest {
         assertThat(repeatedUpdate, willCompleteSuccessfully());
         assertThat(lowerUpdate, willCompleteSuccessfully());
         assertEquals(higherWatermark, lowWatermark.getLowWatermark());
+    }
+
+    @Test
+    void completedWatermarkDoesNotWaitForHigherBlockedCandidate() {
+        assertThat(lowWatermark.startAsync(new ComponentContext()), willCompleteSuccessfully());
+        HybridTimestamp completed = new HybridTimestamp(100, 0);
+        assertThat(lowWatermark.updateLowWatermarkAsync(completed), willCompleteSuccessfully());
+
+        UUID lockId = UUID.randomUUID();
+        assertTrue(lowWatermark.tryLock(lockId, new HybridTimestamp(150, 0)));
+        CompletableFuture<Void> higher = lowWatermark.updateLowWatermarkAsync(new HybridTimestamp(200, 0));
+        try {
+            assertThat(higher, willTimeoutFast());
+            assertThat(lowWatermark.updateLowWatermarkAsync(completed), willCompleteSuccessfully());
+            assertFalse(higher.isDone());
+        } finally {
+            lowWatermark.unlock(lockId);
+        }
+        assertThat(higher, willCompleteSuccessfully());
+    }
+
+    @Test
+    void recoveredWatermarkDoesNotWaitForHigherBlockedCandidate() {
+        HybridTimestamp recovered = new HybridTimestamp(100, 0);
+        when(vaultManager.get(LOW_WATERMARK_VAULT_KEY))
+                .thenReturn(new VaultEntry(LOW_WATERMARK_VAULT_KEY, recovered.toBytes()));
+        assertThat(lowWatermark.startAsync(new ComponentContext()), willCompleteSuccessfully());
+        UUID lockId = UUID.randomUUID();
+        assertTrue(lowWatermark.tryLock(lockId, new HybridTimestamp(150, 0)));
+        CompletableFuture<Void> higher = lowWatermark.updateLowWatermarkAsync(new HybridTimestamp(200, 0));
+        try {
+            assertThat(higher, willTimeoutFast());
+            assertThat(lowWatermark.updateLowWatermarkAsync(recovered), willCompleteSuccessfully());
+            assertFalse(higher.isDone());
+        } finally {
+            lowWatermark.unlock(lockId);
+        }
+        assertThat(higher, willCompleteSuccessfully());
+    }
+
+    @Test
+    void publishedWatermarkWaitsForItsListenerButNotHigherCandidate() {
+        assertThat(lowWatermark.startAsync(new ComponentContext()), willCompleteSuccessfully());
+        HybridTimestamp first = new HybridTimestamp(100, 0);
+        CompletableFuture<Boolean> listener = new CompletableFuture<>();
+        CompletableFuture<Void> entered = new CompletableFuture<>();
+        lowWatermark.listen(LOW_WATERMARK_CHANGED, (ChangeLowWatermarkEventParameters event) -> {
+            if (event.newLowWatermark().equals(first)) {
+                entered.complete(null);
+                return listener;
+            }
+            return falseCompletedFuture();
+        });
+        UUID lockId = UUID.randomUUID();
+        assertTrue(lowWatermark.tryLock(lockId, new HybridTimestamp(150, 0)));
+        CompletableFuture<Void> initial = lowWatermark.updateLowWatermarkAsync(first);
+        assertThat(entered, willCompleteSuccessfully());
+        CompletableFuture<Void> higher = lowWatermark.updateLowWatermarkAsync(new HybridTimestamp(200, 0));
+        CompletableFuture<Void> repeated = lowWatermark.updateLowWatermarkAsync(first);
+        CompletableFuture<Void> cancelled = lowWatermark.updateLowWatermarkAsync(first);
+        cancelled.cancel(false);
+        try {
+            assertEquals(first, lowWatermark.getLowWatermark());
+            assertThat(repeated, willTimeoutFast());
+            assertFalse(initial.isDone());
+            listener.complete(false);
+            assertThat(initial, willCompleteSuccessfully());
+            assertThat(repeated, willCompleteSuccessfully());
+            assertFalse(higher.isDone());
+        } finally {
+            listener.complete(false);
+            lowWatermark.unlock(lockId);
+        }
+        assertThat(higher, willCompleteSuccessfully());
+    }
+
+    @Test
+    void vaultFailureDoesNotLeaveCompletionWaitersHanging() {
+        assertThat(lowWatermark.startAsync(new ComponentContext()), willCompleteSuccessfully());
+        doThrow(new IllegalStateException("vault failed")).when(vaultManager).put(eq(LOW_WATERMARK_VAULT_KEY), any());
+
+        assertThat(lowWatermark.updateLowWatermarkAsync(new HybridTimestamp(100, 0)),
+                willThrowWithCauseOrSuppressed(IllegalStateException.class));
+        assertThat(lowWatermark.updateLowWatermarkAsync(new HybridTimestamp(200, 0)),
+                willThrowWithCauseOrSuppressed(IllegalStateException.class));
+    }
+
+    @Test
+    void listenerFailureFailsAllUncompletedWaiters() {
+        assertThat(lowWatermark.startAsync(new ComponentContext()), willCompleteSuccessfully());
+        CompletableFuture<Boolean> listener = new CompletableFuture<>();
+        lowWatermark.listen(LOW_WATERMARK_CHANGED, event -> listener);
+        CompletableFuture<Void> first = lowWatermark.updateLowWatermarkAsync(new HybridTimestamp(100, 0));
+        CompletableFuture<Void> higher = lowWatermark.updateLowWatermarkAsync(new HybridTimestamp(200, 0));
+        listener.completeExceptionally(new IllegalStateException("listener failed"));
+
+        assertThat(first, willThrowWithCauseOrSuppressed(IllegalStateException.class));
+        assertThat(higher, willThrowWithCauseOrSuppressed(IllegalStateException.class));
+        assertThat(lowWatermark.updateLowWatermarkAsync(new HybridTimestamp(100, 0)),
+                willThrowWithCauseOrSuppressed(IllegalStateException.class));
+    }
+
+    @Test
+    void stoppingCompletesBlockedWaiters() {
+        assertThat(lowWatermark.startAsync(new ComponentContext()), willCompleteSuccessfully());
+        UUID lockId = UUID.randomUUID();
+        assertTrue(lowWatermark.tryLock(lockId, new HybridTimestamp(50, 0)));
+        CompletableFuture<Void> wait = lowWatermark.updateLowWatermarkAsync(new HybridTimestamp(100, 0));
+        assertThat(wait, willTimeoutFast());
+
+        assertThat(lowWatermark.stopAsync(new ComponentContext()), willCompleteSuccessfully());
+        assertThat(wait, willThrowWithCauseOrSuppressed(NodeStoppingException.class));
+        lowWatermark.unlock(lockId);
+    }
+
+    @Test
+    void completionCallbackCanWaitOnAnotherThread() {
+        assertThat(lowWatermark.startAsync(new ComponentContext()), willCompleteSuccessfully());
+        CompletableFuture<Boolean> listener = new CompletableFuture<>();
+        lowWatermark.listen(LOW_WATERMARK_CHANGED, event -> listener);
+        HybridTimestamp value = new HybridTimestamp(100, 0);
+        CompletableFuture<Void> first = lowWatermark.updateLowWatermarkAsync(value);
+        CompletableFuture<Void> callback = first.thenRun(() -> {
+            CompletableFuture<Void> otherThread = CompletableFuture.runAsync(() ->
+                    assertThat(lowWatermark.updateLowWatermarkAsync(value), willCompleteSuccessfully()));
+            assertThat(otherThread, willCompleteSuccessfully());
+        });
+
+        listener.complete(false);
+        assertThat(callback, willCompleteSuccessfully());
     }
 
     @Test

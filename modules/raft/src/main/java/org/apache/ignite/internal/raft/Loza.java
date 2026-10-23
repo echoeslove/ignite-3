@@ -470,6 +470,19 @@ public class Loza implements RaftManager {
         }
     }
 
+    /** Resets logs and snapshots for installation, preserving durable election state. */
+    public void resetRaftNodeStoragesForSnapshot(RaftNodeId nodeId, RaftGroupOptions groupOptions) throws NodeStoppingException {
+        if (!busyLock.enterBusy()) {
+            throw new NodeStoppingException();
+        }
+
+        try {
+            raftServer.resetRaftNodeStoragesForSnapshot(nodeId, groupOptions);
+        } finally {
+            busyLock.leaveBusy();
+        }
+    }
+
     /**
      * Creates replication log meta storage for the given group ID.
      *

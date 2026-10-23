@@ -1335,6 +1335,14 @@ public class ReplicaManager extends AbstractEventProducer<LocalReplicaEvent, Loc
         ((Loza) raftManager).destroyRaftNodeStoragesDurably(raftNodeId, groupOptions);
     }
 
+    /** Resets logs and snapshots for installation without deleting durable election state. */
+    public void resetReplicationProtocolStoragesForSnapshot(ReplicationGroupId replicaGrpId, boolean isVolatileStorage)
+            throws NodeStoppingException {
+        RaftNodeId raftNodeId = new RaftNodeId(replicaGrpId, new Peer(localNodeConsistentId));
+
+        ((Loza) raftManager).resetRaftNodeStoragesForSnapshot(raftNodeId, groupOptionsForPartition(isVolatileStorage, null));
+    }
+
     /**
      * Creates replication log meta storage for the given group ID.
      *

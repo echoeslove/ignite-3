@@ -23,19 +23,11 @@ import org.apache.ignite.internal.replicator.ReplicationGroupId;
 /** Small abstraction for accessing the replication log. */
 public interface LogStorageAccess {
     /**
-     * Destroys the replication log.
+     * Resets the replication log and snapshots for installation, preserving durable term and vote.
      *
      * @param replicationGroupId Replication group ID.
      * @param isVolatile Is storage volatile.
      * @throws NodeStoppingException If the node is being stopped.
      */
-    void destroy(ReplicationGroupId replicationGroupId, boolean isVolatile) throws NodeStoppingException;
-
-    /**
-     * Creates a replication log meta storage.
-     *
-     * @param replicationGroupId Replication group ID.
-     * @throws NodeStoppingException If the node is being stopped.
-     */
-    void createMetaStorage(ReplicationGroupId replicationGroupId) throws NodeStoppingException;
+    void resetForSnapshot(ReplicationGroupId replicationGroupId, boolean isVolatile) throws NodeStoppingException;
 }

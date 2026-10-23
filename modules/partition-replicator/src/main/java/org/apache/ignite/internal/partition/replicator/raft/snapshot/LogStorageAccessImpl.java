@@ -31,12 +31,7 @@ public class LogStorageAccessImpl implements LogStorageAccess {
     }
 
     @Override
-    public void destroy(ReplicationGroupId replicationGroupId, boolean isVolatile) throws NodeStoppingException {
-        replicaManager.destroyReplicationProtocolStorages(replicationGroupId, isVolatile);
-    }
-
-    @Override
-    public void createMetaStorage(ReplicationGroupId replicationGroupId) throws NodeStoppingException {
-        replicaManager.createMetaStorage(replicationGroupId);
+    public void resetForSnapshot(ReplicationGroupId replicationGroupId, boolean isVolatile) throws NodeStoppingException {
+        replicaManager.resetReplicationProtocolStoragesForSnapshot(replicationGroupId, isVolatile);
     }
 }

@@ -33,6 +33,7 @@ import static org.apache.ignite.internal.testframework.matchers.CompletableFutur
 import static org.apache.ignite.internal.testframework.matchers.CompletableFutureMatcher.willBe;
 import static org.apache.ignite.internal.testframework.matchers.CompletableFutureMatcher.willCompleteSuccessfully;
 import static org.apache.ignite.internal.util.CompletableFutures.emptySetCompletedFuture;
+import static org.apache.ignite.internal.util.CompletableFutures.falseCompletedFuture;
 import static org.apache.ignite.internal.util.CompletableFutures.nullCompletedFuture;
 import static org.apache.ignite.internal.util.IgniteUtils.startAsync;
 import static org.apache.ignite.internal.util.IgniteUtils.stopAsync;
@@ -48,6 +49,7 @@ import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
@@ -347,6 +349,27 @@ class PartitionReplicaLifecycleManagerTest extends BaseIgniteAbstractTest {
         inOrder.verify(raftManager, timeout(1_000)).stopRaftNodes(zonePartitionId);
         inOrder.verify(zoneResourcesManager, timeout(1_000)).destroyZonePartitionResources(zonePartitionId);
         inOrder.verify(replicaManager, timeout(1_000)).destroyReplicationProtocolStoragesDurably(zonePartitionId, false);
+    }
+
+    @Test
+    void unfinishedRebalanceResetPreservesElectionState() throws NodeStoppingException {
+        when(txStatePartitionStorage.clear()).thenReturn(nullCompletedFuture());
+        int zoneId = catalogManager.catalog(catalogManager.latestCatalogVersion()).defaultZone().id();
+        var zonePartitionId = new ZonePartitionId(zoneId, 0);
+        partitionReplicaLifecycleManager.listen(LocalPartitionReplicaEvent.BEFORE_REPLICA_STARTED,
+                (LocalBeforeReplicaStartEventParameters event) -> {
+                    event.registerStorageInRebalanceState();
+                    event.addCleanupAction(() -> {
+                        assertDoesNotThrow(() ->
+                                verify(replicaManager).resetReplicationProtocolStoragesForSnapshot(zonePartitionId, false));
+                        return nullCompletedFuture();
+                    });
+                    return falseCompletedFuture();
+                });
+
+        assertThat(partitionReplicaLifecycleManager.restartPartition(zonePartitionId, Long.MAX_VALUE, clock.nowLong()),
+                willCompleteSuccessfully());
+        verify(replicaManager, never()).destroyReplicationProtocolStorages(zonePartitionId, false);
     }
 
     @Test
