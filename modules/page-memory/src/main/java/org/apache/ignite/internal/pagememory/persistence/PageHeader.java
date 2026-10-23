@@ -18,14 +18,15 @@
 package org.apache.ignite.internal.pagememory.persistence;
 
 import static org.apache.ignite.internal.pagememory.persistence.PersistentPageMemory.INVALID_REL_PTR;
+import static org.apache.ignite.internal.util.GridUnsafe.compareAndSwapInt;
 import static org.apache.ignite.internal.util.GridUnsafe.decrementAndGetInt;
 import static org.apache.ignite.internal.util.GridUnsafe.getInt;
 import static org.apache.ignite.internal.util.GridUnsafe.getIntVolatile;
 import static org.apache.ignite.internal.util.GridUnsafe.getLong;
 import static org.apache.ignite.internal.util.GridUnsafe.putInt;
-import static org.apache.ignite.internal.util.GridUnsafe.putIntVolatile;
 import static org.apache.ignite.internal.util.GridUnsafe.putLong;
 import static org.apache.ignite.internal.util.GridUnsafe.putLongVolatile;
+import static org.apache.ignite.internal.util.IgniteUtils.isPow2;
 
 import org.apache.ignite.internal.pagememory.FullPageId;
 import org.apache.ignite.internal.util.GridUnsafe;
@@ -109,7 +110,7 @@ public class PageHeader {
      * @param absPtr Absolute pointer.
      */
     public static boolean dirty(long absPtr) {
-        return flag(absPtr, DIRTY_FLAG, false);
+        return flag(absPtr, DIRTY_FLAG);
     }
 
     /**
@@ -120,21 +121,21 @@ public class PageHeader {
      * @return Previous value of dirty flag.
      */
     public static boolean dirty(long absPtr, boolean dirty) {
-        return flag(absPtr, DIRTY_FLAG, dirty, false);
+        return flag(absPtr, DIRTY_FLAG, dirty);
     }
 
     /**
      * Reads the value of a header validity flag. Does it using a volatile memory access.
      */
     public static boolean headerIsValid(long absPtr) {
-        return flag(absPtr, HEADER_IS_VALID_FLAG, true);
+        return flag(absPtr, HEADER_IS_VALID_FLAG);
     }
 
     /**
      * Updates the value of a header validity flag. Does it using a volatile memory access.
      */
     public static void headerIsValid(long absPtr, boolean valid) {
-        flag(absPtr, HEADER_IS_VALID_FLAG, valid, true);
+        flag(absPtr, HEADER_IS_VALID_FLAG, valid);
     }
 
     /**
@@ -142,13 +143,12 @@ public class PageHeader {
      *
      * @param absPtr Absolute pointer.
      * @param flagMask Flag mask.
-     * @param volatileAccess Whether to use volatile memory access.
      */
-    private static boolean flag(long absPtr, int flagMask, boolean volatileAccess) {
+    private static boolean flag(long absPtr, int flagMask) {
         assert (flagMask & 0xFFFFFF) == 0 : Integer.toHexString(flagMask);
-        assert Long.bitCount(flagMask) == 1 : Integer.toHexString(flagMask);
+        assert isPow2(flagMask) : Integer.toHexString(flagMask);
 
-        int flags = volatileAccess ? getIntVolatile(null, absPtr + FLAGS_OFFSET) : getInt(absPtr + FLAGS_OFFSET);
+        int flags = getIntVolatile(null, absPtr + FLAGS_OFFSET);
 
         return (flags & flagMask) != 0;
     }
@@ -159,30 +159,27 @@ public class PageHeader {
      * @param absPtr Absolute pointer.
      * @param flagMask Flag mask.
      * @param set New flag value.
-     * @param volatileAccess Whether to use volatile memory access.
      * @return Previous flag value.
      */
-    private static boolean flag(long absPtr, int flagMask, boolean set, boolean volatileAccess) {
+    private static boolean flag(long absPtr, int flagMask, boolean set) {
         assert (flagMask & 0xFFFFFF) == 0 : Integer.toHexString(flagMask);
-        assert Long.bitCount(flagMask) == 1 : Integer.toHexString(flagMask);
+        assert isPow2(flagMask) : Integer.toHexString(flagMask);
 
-        int flags = volatileAccess ? getIntVolatile(null, absPtr + FLAGS_OFFSET) : getInt(absPtr + FLAGS_OFFSET);
+        while (true) {
+            int flags = getIntVolatile(null, absPtr + FLAGS_OFFSET);
 
-        boolean was = (flags & flagMask) != 0;
+            boolean was = (flags & flagMask) != 0;
 
-        if (set) {
-            flags |= flagMask;
-        } else {
-            flags &= ~flagMask;
+            if (was == set) {
+                return was;
+            }
+
+            int newFlags = set ? (flags | flagMask) : (flags & ~flagMask);
+
+            if (compareAndSwapInt(null, absPtr + FLAGS_OFFSET, flags, newFlags)) {
+                return was;
+            }
         }
-
-        if (volatileAccess) {
-            putIntVolatile(null, absPtr + FLAGS_OFFSET, flags);
-        } else {
-            putInt(absPtr + FLAGS_OFFSET, flags);
-        }
-
-        return was;
     }
 
     /**

@@ -40,12 +40,19 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.apache.ignite.internal.pagememory.FullPageId;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 /** For {@link PageHeader} testing. */
 public class PageHeaderTest {
@@ -105,9 +112,11 @@ public class PageHeaderTest {
     void testReadWriteDirtyFlagValue() {
         assertFalse(dirty(pageHeaderAddr, true));
         assertTrue(dirty(pageHeaderAddr));
+        assertTrue(dirty(pageHeaderAddr, true));
 
         assertTrue(dirty(pageHeaderAddr, false));
         assertFalse(dirty(pageHeaderAddr));
+        assertFalse(dirty(pageHeaderAddr, false));
     }
 
     @Test
@@ -123,6 +132,76 @@ public class PageHeaderTest {
         headerIsValid(pageHeaderAddr, false);
         assertFalse(headerIsValid(pageHeaderAddr));
         assertFalse(dirty(pageHeaderAddr));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void testConcurrentFlagUpdates(boolean dirtyValue, boolean validValue) throws Exception {
+        int iterations = 20_000;
+        CyclicBarrier barrier = new CyclicBarrier(3);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+
+        try {
+            Future<?> dirtyUpdates = executor.submit(() -> {
+                for (int i = 0; i < iterations; i++) {
+                    barrier.await(10, TimeUnit.SECONDS);
+                    dirty(pageHeaderAddr, dirtyValue);
+                    barrier.await(10, TimeUnit.SECONDS);
+                }
+                return null;
+            });
+            Future<?> validityUpdates = executor.submit(() -> {
+                for (int i = 0; i < iterations; i++) {
+                    barrier.await(10, TimeUnit.SECONDS);
+                    headerIsValid(pageHeaderAddr, validValue);
+                    barrier.await(10, TimeUnit.SECONDS);
+                }
+                return null;
+            });
+
+            int lostUpdates = 0;
+
+            for (int i = 0; i < iterations; i++) {
+                dirty(pageHeaderAddr, !dirtyValue);
+                headerIsValid(pageHeaderAddr, !validValue);
+                barrier.await(10, TimeUnit.SECONDS);
+                barrier.await(10, TimeUnit.SECONDS);
+
+                if (dirty(pageHeaderAddr) != dirtyValue || headerIsValid(pageHeaderAddr) != validValue) {
+                    lostUpdates++;
+                }
+            }
+
+            dirtyUpdates.get(10, TimeUnit.SECONDS);
+            validityUpdates.get(10, TimeUnit.SECONDS);
+
+            assertEquals(0, lostUpdates, "Concurrent updates must preserve both flags");
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void testFlagUpdatesPreservePageHeaderLayout() {
+        assertEquals(48, PAGE_OVERHEAD);
+        assertEquals(32, PAGE_LOCK_OFFSET);
+
+        fullPageId(pageHeaderAddr, new FullPageId(4, 2));
+        partitionGeneration(pageHeaderAddr, 42);
+        tempBufferPointer(pageHeaderAddr, 123);
+        acquirePage(pageHeaderAddr);
+
+        dirty(pageHeaderAddr, true);
+        headerIsValid(pageHeaderAddr, true);
+        dirty(pageHeaderAddr, false);
+        headerIsValid(pageHeaderAddr, false);
+
+        assertEquals(new FullPageId(4, 2), fullPageId(pageHeaderAddr));
+        assertEquals(42, partitionGeneration(pageHeaderAddr));
+        assertEquals(123, tempBufferPointer(pageHeaderAddr));
+        assertEquals(1, pinCount(pageHeaderAddr));
+        assertEquals(0L, getLong(pageHeaderAddr + PAGE_LOCK_OFFSET));
     }
 
     @Test
