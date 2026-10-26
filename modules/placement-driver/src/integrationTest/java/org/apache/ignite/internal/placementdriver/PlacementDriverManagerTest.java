@@ -204,12 +204,11 @@ public class PlacementDriverManagerTest extends BasePlacementDriverTest {
 
         logicalTopologyService = new LogicalTopologyServiceTestImpl(clusterService);
 
-        TopologyAwareRaftGroupServiceFactory topologyAwareRaftGroupServiceFactory = new TopologyAwareRaftGroupServiceFactory(
-                clusterService,
-                logicalTopologyService,
-                Loza.FACTORY,
-                eventsClientListener
-        );
+        var topologyAwareRaftGroupServiceFactory = new TopologyAwareRaftGroupServiceFactory(
+                clusterService, logicalTopologyService, Loza.FACTORY, eventsClientListener);
+
+        var msRaftServiceFactory = new org.apache.ignite.internal.cluster.management.raft.PhysicalTopologyAwareRaftGroupServiceFactory(
+                    clusterService, eventsClientListener, mock(FailureProcessor.class));
 
         ComponentWorkingDir workingDir = new ComponentWorkingDir(workDir.resolve("loza"));
 
@@ -246,7 +245,7 @@ public class PlacementDriverManagerTest extends BasePlacementDriverTest {
                 raftManager,
                 storage,
                 nodeClock,
-                topologyAwareRaftGroupServiceFactory,
+                msRaftServiceFactory,
                 new NoOpMetricManager(),
                 systemDistributedConfiguration,
                 msRaftConfigurer,

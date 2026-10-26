@@ -103,10 +103,11 @@ import org.apache.ignite.internal.raft.RaftGroupEventsListener;
 import org.apache.ignite.internal.raft.RaftGroupOptionsConfigurer;
 import org.apache.ignite.internal.raft.RaftManager;
 import org.apache.ignite.internal.raft.RaftNodeId;
-import org.apache.ignite.internal.raft.client.TopologyAwareRaftGroupService;
-import org.apache.ignite.internal.raft.client.TopologyAwareRaftGroupServiceFactory;
+import org.apache.ignite.internal.raft.StoppingExceptionFactories;
+import org.apache.ignite.internal.raft.TimeAwareRaftGroupServiceFactory;
+import org.apache.ignite.internal.raft.client.PhysicalTopologyAwareRaftGroupService;
 import org.apache.ignite.internal.raft.server.RaftGroupOptions;
-import org.apache.ignite.internal.raft.service.RaftGroupService;
+import org.apache.ignite.internal.raft.service.TimeAwareRaftGroupService;
 import org.apache.ignite.internal.tostring.S;
 import org.apache.ignite.internal.util.Cursor;
 import org.apache.ignite.internal.util.ExceptionUtils;
@@ -166,7 +167,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
 
     private final ClusterTimeImpl clusterTime;
 
-    private final TopologyAwareRaftGroupServiceFactory topologyAwareRaftGroupServiceFactory;
+    private final TimeAwareRaftGroupServiceFactory raftServiceFactory;
 
     private final MetricManager metricManager;
 
@@ -193,7 +194,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
     private final CompletableFuture<Void> raftNodeStarted = new CompletableFuture<>();
 
     /** Gets completed when a Raft service (that is, the Raft client for talking with the group) is started for Metastorage. */
-    private final OrderingFuture<RaftGroupService> raftServiceFuture = new OrderingFuture<>();
+    private final OrderingFuture<TimeAwareRaftGroupService> raftServiceFuture = new OrderingFuture<>();
 
     /**
      * State of changing Raft group peers (aka voting set members). Currently only used for forceful members reset during repair.
@@ -239,7 +240,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
             RaftManager raftMgr,
             KeyValueStorage storage,
             HybridClock clock,
-            TopologyAwareRaftGroupServiceFactory topologyAwareRaftGroupServiceFactory,
+            TimeAwareRaftGroupServiceFactory raftServiceFactory,
             MetricManager metricManager,
             MetastorageRepairStorage metastorageRepairStorage,
             MetastorageRepair metastorageRepair,
@@ -256,7 +257,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         this.clock = clock;
         this.clusterTime = new ClusterTimeImpl(clusterService.nodeName(), busyLock, clock, failureProcessor);
         this.metaStorageMetricSource = new MetaStorageMetricSource(clusterTime);
-        this.topologyAwareRaftGroupServiceFactory = topologyAwareRaftGroupServiceFactory;
+        this.raftServiceFactory = raftServiceFactory;
         this.metricManager = metricManager;
         this.metastorageRepairStorage = metastorageRepairStorage;
         this.metastorageRepair = metastorageRepair;
@@ -282,7 +283,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
             RaftManager raftMgr,
             KeyValueStorage storage,
             HybridClock clock,
-            TopologyAwareRaftGroupServiceFactory topologyAwareRaftGroupServiceFactory,
+            TimeAwareRaftGroupServiceFactory raftServiceFactory,
             MetricManager metricManager,
             SystemDistributedConfiguration systemConfiguration,
             RaftGroupOptionsConfigurer raftGroupOptionsConfigurer
@@ -294,7 +295,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
                 raftMgr,
                 storage,
                 clock,
-                topologyAwareRaftGroupServiceFactory,
+                raftServiceFactory,
                 metricManager,
                 systemConfiguration,
                 raftGroupOptionsConfigurer,
@@ -313,7 +314,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
             RaftManager raftMgr,
             KeyValueStorage storage,
             HybridClock clock,
-            TopologyAwareRaftGroupServiceFactory topologyAwareRaftGroupServiceFactory,
+            TimeAwareRaftGroupServiceFactory raftServiceFactory,
             MetricManager metricManager,
             SystemDistributedConfiguration systemConfiguration,
             RaftGroupOptionsConfigurer raftGroupOptionsConfigurer,
@@ -326,7 +327,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
                 raftMgr,
                 storage,
                 clock,
-                topologyAwareRaftGroupServiceFactory,
+                raftServiceFactory,
                 metricManager,
                 new NoOpMetastorageRepairStorage(),
                 (nodes, mgReplicationFactor) -> nullCompletedFuture(),
@@ -351,7 +352,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
 
     private CompletableFuture<?> recover(MetaStorageService service) {
         return inBusyLockAsync(busyLock, () -> {
-            service.currentRevisions()
+            service.currentRevisions(TimeAwareRaftGroupService.NO_TIMEOUT)
                     .thenAccept(targetRevisions -> {
                         assert targetRevisions != null;
 
@@ -435,7 +436,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         long localChecksum = storage.checksum(localRevision);
 
         return doWithOneOffRaftGroupService(PeersAndLearners.fromConsistentIds(metastorageNodes), raftClient -> {
-            return createMetaStorageService(raftClient).checksum(localRevision)
+            return createMetaStorageService(raftClient).checksum(localRevision, TimeAwareRaftGroupService.NO_TIMEOUT)
                     .thenAccept(leaderChecksumInfo -> {
                         LOG.info(
                                 "Validating Metastorage for divergence [localRevision={}, localChecksum={}, leaderChecksumInfo={}",
@@ -476,7 +477,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
     private CompletableFuture<MetaStorageServiceImpl> initializeMetastorage(MetaStorageInfo metaStorageInfo) {
         String thisNodeName = clusterService.nodeName();
 
-        CompletableFuture<? extends RaftGroupService> localRaftServiceFuture;
+        CompletableFuture<PhysicalTopologyAwareRaftGroupService> localRaftServiceFuture;
         try {
             localRaftServiceFuture = metaStorageInfo.metaStorageNodes().contains(thisNodeName)
                     ? startVotingNode(metaStorageInfo)
@@ -493,7 +494,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
                 });
     }
 
-    private MetaStorageServiceImpl createMetaStorageService(RaftGroupService raftService) {
+    private MetaStorageServiceImpl createMetaStorageService(TimeAwareRaftGroupService raftService) {
         return new MetaStorageServiceImpl(
                 clusterService.nodeName(),
                 raftService,
@@ -503,7 +504,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         );
     }
 
-    private CompletableFuture<? extends RaftGroupService> startVotingNode(
+    private CompletableFuture<PhysicalTopologyAwareRaftGroupService> startVotingNode(
             MetaStorageInfo metaStorageInfo
     ) throws NodeStoppingException {
         PeersAndLearners configuration = PeersAndLearners.fromConsistentIds(metaStorageInfo.metaStorageNodes());
@@ -513,7 +514,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         return startRaftNode(configuration, localPeer, metaStorageInfo);
     }
 
-    private CompletableFuture<? extends RaftGroupService> startLearnerNode(
+    private CompletableFuture<PhysicalTopologyAwareRaftGroupService> startLearnerNode(
             MetaStorageInfo metaStorageInfo
     ) throws NodeStoppingException {
         String thisNodeName = clusterService.nodeName();
@@ -524,7 +525,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         return startRaftNode(configuration, localPeer, metaStorageInfo);
     }
 
-    private CompletableFuture<? extends RaftGroupService> startRaftNode(
+    private CompletableFuture<PhysicalTopologyAwareRaftGroupService> startRaftNode(
             PeersAndLearners configuration,
             Peer localPeer,
             MetaStorageInfo metaStorageInfo
@@ -532,8 +533,8 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         SystemDistributedConfiguration currentSystemConfiguration = systemConfiguration;
         assert currentSystemConfiguration != null : "System configuration has not been set";
 
-        CompletableFuture<TopologyAwareRaftGroupService> serviceFuture = CompletableFuture.supplyAsync(() -> {
-            TopologyAwareRaftGroupService service = startRaftNodeItself(configuration, localPeer, metaStorageInfo);
+        CompletableFuture<PhysicalTopologyAwareRaftGroupService> serviceFuture = CompletableFuture.supplyAsync(() -> {
+            PhysicalTopologyAwareRaftGroupService service = startRaftNodeItself(configuration, localPeer, metaStorageInfo);
 
             raftNodeStarted.complete(null);
 
@@ -546,7 +547,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         });
     }
 
-    private TopologyAwareRaftGroupService startRaftNodeItself(
+    private PhysicalTopologyAwareRaftGroupService startRaftNodeItself(
             PeersAndLearners configuration,
             Peer localPeer,
             MetaStorageInfo metaStorageInfo
@@ -560,12 +561,14 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         );
 
         try {
-            return raftMgr.startSystemRaftGroupNodeAndWaitNodeReady(
+            // Safe cast: raftServiceFactory is always PhysicalTopologyAwareRaftGroupServiceFactory, which produces
+            // PhysicalTopologyAwareRaftGroupService. We need the concrete type for subscribeLeader().
+            return (PhysicalTopologyAwareRaftGroupService) raftMgr.startSystemRaftGroupNodeAndWaitNodeReadyTimeAware(
                     raftNodeId(localPeer),
                     configuration,
                     raftListener,
                     RaftGroupEventsListener.noopLsnr,
-                    topologyAwareRaftGroupServiceFactory,
+                    raftServiceFactory,
                     options -> {
                         raftGroupOptionsConfigurer.configure(options);
 
@@ -637,7 +640,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
                 });
     }
 
-    private void updateRaftClientConfigIfEventIsNotStale(RaftGroupConfiguration configuration, RaftGroupService raftService) {
+    private void updateRaftClientConfigIfEventIsNotStale(RaftGroupConfiguration configuration, TimeAwareRaftGroupService raftService) {
         IndexWithTerm newIndexWithTerm = new IndexWithTerm(configuration.index(), configuration.term());
 
         lastHandledIndexWithTerm.updateAndGet(existingIndexWithTerm -> {
@@ -658,7 +661,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         });
     }
 
-    private void handlePeersChange(RaftGroupConfiguration configuration, RaftGroupService raftService) {
+    private void handlePeersChange(RaftGroupConfiguration configuration, TimeAwareRaftGroupService raftService) {
         synchronized (peersChangeMutex) {
             if (peersChangeState == null || configuration.term() <= peersChangeState.termBeforeChange) {
                 return;
@@ -670,7 +673,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
                 LOG.info("Lonely leader has been established, changing voting set to target set: {}", currentState.targetPeers);
 
                 PeersAndLearners newConfig = PeersAndLearners.fromConsistentIds(currentState.targetPeers);
-                raftService.changePeersAndLearners(newConfig, configuration.term())
+                raftService.changePeersAndLearners(newConfig, configuration.term(), TimeAwareRaftGroupService.NO_TIMEOUT)
                         .whenComplete((res, ex) -> {
                             if (ex != null) {
                                 Throwable unwrapped = ExceptionUtils.unwrapCause(ex);
@@ -900,7 +903,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
                 busyLock,
                 () -> withTrackReadOperationFromLeaderFuture(
                         storage.revision(),
-                        () -> metaStorageSvcFut.thenCompose(svc -> svc.get(key))
+                        () -> metaStorageSvcFut.thenCompose(svc -> svc.get(key, TimeAwareRaftGroupService.NO_TIMEOUT))
                 )
         );
     }
@@ -911,7 +914,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
                 busyLock,
                 () -> withTrackReadOperationFromLeaderFuture(
                         revUpperBound,
-                        () -> metaStorageSvcFut.thenCompose(svc -> svc.get(key, revUpperBound))
+                        () -> metaStorageSvcFut.thenCompose(svc -> svc.get(key, revUpperBound, TimeAwareRaftGroupService.NO_TIMEOUT))
                 )
         );
     }
@@ -963,7 +966,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
                 busyLock,
                 () -> withTrackReadOperationFromLeaderFuture(
                         storage.revision(),
-                        () -> metaStorageSvcFut.thenCompose(svc -> svc.getAll(keys))
+                        () -> metaStorageSvcFut.thenCompose(svc -> svc.getAll(keys, TimeAwareRaftGroupService.NO_TIMEOUT))
                 )
         );
     }
@@ -975,7 +978,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         }
 
         try {
-            return metaStorageSvcFut.thenCompose(svc -> svc.put(key, val));
+            return metaStorageSvcFut.thenCompose(svc -> svc.put(key, val, TimeAwareRaftGroupService.NO_TIMEOUT));
         } finally {
             busyLock.leaveBusy();
         }
@@ -988,7 +991,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         }
 
         try {
-            return metaStorageSvcFut.thenCompose(svc -> svc.putAll(vals));
+            return metaStorageSvcFut.thenCompose(svc -> svc.putAll(vals, TimeAwareRaftGroupService.NO_TIMEOUT));
         } finally {
             busyLock.leaveBusy();
         }
@@ -1001,7 +1004,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         }
 
         try {
-            return metaStorageSvcFut.thenCompose(svc -> svc.remove(key));
+            return metaStorageSvcFut.thenCompose(svc -> svc.remove(key, TimeAwareRaftGroupService.NO_TIMEOUT));
         } finally {
             busyLock.leaveBusy();
         }
@@ -1014,7 +1017,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         }
 
         try {
-            return metaStorageSvcFut.thenCompose(svc -> svc.removeAll(keys));
+            return metaStorageSvcFut.thenCompose(svc -> svc.removeAll(keys, TimeAwareRaftGroupService.NO_TIMEOUT));
         } finally {
             busyLock.leaveBusy();
         }
@@ -1027,7 +1030,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         }
 
         try {
-            return metaStorageSvcFut.thenCompose(svc -> svc.removeByPrefix(prefix));
+            return metaStorageSvcFut.thenCompose(svc -> svc.removeByPrefix(prefix, TimeAwareRaftGroupService.NO_TIMEOUT));
         } finally {
             busyLock.leaveBusy();
         }
@@ -1040,7 +1043,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         }
 
         try {
-            return metaStorageSvcFut.thenCompose(svc -> svc.invoke(cond, success, failure));
+            return metaStorageSvcFut.thenCompose(svc -> svc.invoke(cond, success, failure, TimeAwareRaftGroupService.NO_TIMEOUT));
         } finally {
             busyLock.leaveBusy();
         }
@@ -1053,7 +1056,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         }
 
         try {
-            return metaStorageSvcFut.thenCompose(svc -> svc.invoke(cond, success, failure));
+            return metaStorageSvcFut.thenCompose(svc -> svc.invoke(cond, success, failure, TimeAwareRaftGroupService.NO_TIMEOUT));
         } finally {
             busyLock.leaveBusy();
         }
@@ -1066,7 +1069,7 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         }
 
         try {
-            return metaStorageSvcFut.thenCompose(svc -> svc.invoke(iif));
+            return metaStorageSvcFut.thenCompose(svc -> svc.invoke(iif, TimeAwareRaftGroupService.NO_TIMEOUT));
         } finally {
             busyLock.leaveBusy();
         }
@@ -1081,7 +1084,8 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         try {
             return withTrackReadOperationFromLeaderPublisher(
                     storage.revision(),
-                    () -> new CompletableFuturePublisher<>(metaStorageSvcFut.thenApply(svc -> svc.range(keyFrom, keyTo, false)))
+                    () -> new CompletableFuturePublisher<>(metaStorageSvcFut.thenApply(
+                            svc -> svc.range(keyFrom, keyTo, false, TimeAwareRaftGroupService.NO_TIMEOUT)))
             );
         } finally {
             busyLock.leaveBusy();
@@ -1102,7 +1106,8 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         try {
             return withTrackReadOperationFromLeaderPublisher(
                     revUpperBound,
-                    () -> new CompletableFuturePublisher<>(metaStorageSvcFut.thenApply(svc -> svc.prefix(keyPrefix, revUpperBound)))
+                    () -> new CompletableFuturePublisher<>(metaStorageSvcFut.thenApply(
+                            svc -> svc.prefix(keyPrefix, revUpperBound, TimeAwareRaftGroupService.NO_TIMEOUT)))
             );
         } finally {
             busyLock.leaveBusy();
@@ -1185,10 +1190,16 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
 
     private <T> CompletableFuture<T> doWithOneOffRaftGroupService(
             PeersAndLearners raftClientConfiguration,
-            Function<RaftGroupService, CompletableFuture<T>> action
+            Function<TimeAwareRaftGroupService, CompletableFuture<T>> action
     ) {
         try {
-            RaftGroupService raftGroupService = raftMgr.startRaftGroupService(MetastorageGroupId.INSTANCE, raftClientConfiguration, true);
+            TimeAwareRaftGroupService raftGroupService = raftMgr.startTimeAwareRaftGroupService(
+                    MetastorageGroupId.INSTANCE,
+                    raftClientConfiguration,
+                    raftServiceFactory,
+                    StoppingExceptionFactories.indicateNodeStop(),
+                    true
+            );
 
             return action.apply(raftGroupService)
                     // This callback should be executed asynchronously due to
@@ -1275,7 +1286,9 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
         }
 
         try {
-            return metaStorageSvcFut.thenCompose(svc -> svc.evictIdempotentCommandsCache(evictionTimestamp));
+            return metaStorageSvcFut.thenCompose(svc ->
+                    svc.evictIdempotentCommandsCache(evictionTimestamp, TimeAwareRaftGroupService.NO_TIMEOUT)
+            );
         } finally {
             busyLock.leaveBusy();
         }
@@ -1406,6 +1419,8 @@ public class MetaStorageManagerImpl implements MetaStorageManager, MetastorageGr
      * @return Pending operation future.
      */
     CompletableFuture<Void> sendCompactionCommand(long compactionRevision) {
-        return inBusyLockAsync(busyLock, () -> metaStorageSvcFut.thenCompose(svc -> svc.sendCompactionCommand(compactionRevision)));
+        return inBusyLockAsync(busyLock, () -> metaStorageSvcFut.thenCompose(
+                svc -> svc.sendCompactionCommand(compactionRevision, TimeAwareRaftGroupService.NO_TIMEOUT)
+        ));
     }
 }

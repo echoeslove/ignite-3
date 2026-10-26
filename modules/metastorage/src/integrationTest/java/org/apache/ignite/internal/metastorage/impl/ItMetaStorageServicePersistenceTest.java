@@ -19,6 +19,10 @@ package org.apache.ignite.internal.metastorage.impl;
 
 import static org.apache.ignite.internal.testframework.matchers.CompletableFutureMatcher.willCompleteSuccessfully;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -45,6 +49,7 @@ import org.apache.ignite.internal.raft.server.impl.JraftServerImpl;
 import org.apache.ignite.internal.raft.service.ItAbstractListenerSnapshotTest;
 import org.apache.ignite.internal.raft.service.RaftGroupListener;
 import org.apache.ignite.internal.raft.service.RaftGroupService;
+import org.apache.ignite.internal.raft.service.TimeAwareRaftGroupService;
 import org.apache.ignite.internal.raft.util.ThreadLocalOptimizedMarshaller;
 import org.apache.ignite.internal.replicator.TestReplicationGroupId;
 import org.apache.ignite.internal.testframework.ExecutorServiceExtension;
@@ -87,16 +92,25 @@ public class ItMetaStorageServicePersistenceTest extends ItAbstractListenerSnaps
     public void beforeFollowerStop(RaftGroupService service, RaftServer server) {
         InternalClusterNode followerNode = getNode(server);
 
+        // The shared snapshot harness uses the legacy client; adapt only its command runner.
+        TimeAwareRaftGroupService timeAwareService = mock(TimeAwareRaftGroupService.class);
+        when(timeAwareService.run(any(), anyLong())).thenAnswer(invocation -> {
+            long timeout = invocation.getArgument(1);
+
+            // The legacy runner uses a negative value for infinite wait; Long.MAX_VALUE would overflow its wall-clock deadline.
+            return service.run(invocation.getArgument(0), timeout == TimeAwareRaftGroupService.NO_TIMEOUT ? -1L : timeout);
+        });
+
         metaStorage = new MetaStorageServiceImpl(
                 followerNode.name(),
-                service,
+                timeAwareService,
                 new IgniteSpinBusyLock(),
                 server.options().getClock(),
                 followerNode.id()
         );
 
         // Put some data in the metastorage
-        assertThat(metaStorage.put(FIRST_KEY, FIRST_VALUE), willCompleteSuccessfully());
+        assertThat(metaStorage.put(FIRST_KEY, FIRST_VALUE, TimeAwareRaftGroupService.NO_TIMEOUT), willCompleteSuccessfully());
 
         // Check that data has been written successfully
         checkEntry(FIRST_KEY.bytes(), FIRST_VALUE, 1);
@@ -113,13 +127,13 @@ public class ItMetaStorageServicePersistenceTest extends ItAbstractListenerSnaps
         }
 
         // Remove the first key from the metastorage
-        assertThat(metaStorage.remove(FIRST_KEY), willCompleteSuccessfully());
+        assertThat(metaStorage.remove(FIRST_KEY, TimeAwareRaftGroupService.NO_TIMEOUT), willCompleteSuccessfully());
 
         // Check that data has been removed
         checkEntry(FIRST_KEY.bytes(), null, 2);
 
         // Put same data again
-        assertThat(metaStorage.put(FIRST_KEY, FIRST_VALUE), willCompleteSuccessfully());
+        assertThat(metaStorage.put(FIRST_KEY, FIRST_VALUE, TimeAwareRaftGroupService.NO_TIMEOUT), willCompleteSuccessfully());
 
         // Check that it has been written
         checkEntry(FIRST_KEY.bytes(), FIRST_VALUE, 3);
@@ -127,7 +141,7 @@ public class ItMetaStorageServicePersistenceTest extends ItAbstractListenerSnaps
 
     @Override
     public void afterSnapshot(RaftGroupService service) {
-        assertThat(metaStorage.put(SECOND_KEY, SECOND_VALUE), willCompleteSuccessfully());
+        assertThat(metaStorage.put(SECOND_KEY, SECOND_VALUE, TimeAwareRaftGroupService.NO_TIMEOUT), willCompleteSuccessfully());
     }
 
     @Override
@@ -179,7 +193,7 @@ public class ItMetaStorageServicePersistenceTest extends ItAbstractListenerSnaps
     }
 
     private void checkEntry(byte[] expKey, byte @Nullable [] expValue, long expRevision) {
-        CompletableFuture<Entry> future = metaStorage.get(new ByteArray(expKey));
+        CompletableFuture<Entry> future = metaStorage.get(new ByteArray(expKey), TimeAwareRaftGroupService.NO_TIMEOUT);
 
         assertThat(future, willCompleteSuccessfully());
 

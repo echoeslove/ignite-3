@@ -1025,8 +1025,7 @@ public class TxManagerImpl implements TxManager, NetworkMessageHandler, SystemVi
                 replicaService,
                 topologyService.localMember(),
                 clockService,
-                placementDriver,
-                failureProcessor
+                placementDriver
         );
 
         txStateVolatileStorage.start();

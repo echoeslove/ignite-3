@@ -481,6 +481,9 @@ public class ErrorGroups {
 
         /** Replication group overloaded exception code. */
         public static final int GROUP_OVERLOADED_ERR = REPLICATOR_ERR_GROUP.registerErrorCode((short) 9);
+
+        /** Replication group unavailable exception code. */
+        public static final int GROUP_UNAVAILABLE_ERR = REPLICATOR_ERR_GROUP.registerErrorCode((short) 10);
     }
 
     /** Storage error group. */

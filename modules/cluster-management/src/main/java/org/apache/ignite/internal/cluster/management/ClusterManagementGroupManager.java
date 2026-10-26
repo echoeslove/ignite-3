@@ -65,6 +65,7 @@ import org.apache.ignite.internal.cluster.management.raft.CmgRaftGroupListener;
 import org.apache.ignite.internal.cluster.management.raft.CmgRaftService;
 import org.apache.ignite.internal.cluster.management.raft.IllegalInitArgumentException;
 import org.apache.ignite.internal.cluster.management.raft.JoinDeniedException;
+import org.apache.ignite.internal.cluster.management.raft.PhysicalTopologyAwareRaftGroupServiceFactory;
 import org.apache.ignite.internal.cluster.management.raft.ValidationManager;
 import org.apache.ignite.internal.cluster.management.raft.commands.JoinReadyCommand;
 import org.apache.ignite.internal.cluster.management.topology.LogicalTopology;
@@ -99,12 +100,13 @@ import org.apache.ignite.internal.raft.RaftGroupConfiguration;
 import org.apache.ignite.internal.raft.RaftGroupOptionsConfigurer;
 import org.apache.ignite.internal.raft.RaftManager;
 import org.apache.ignite.internal.raft.RaftNodeId;
-import org.apache.ignite.internal.raft.service.RaftGroupService;
+import org.apache.ignite.internal.raft.service.TimeAwareRaftGroupService;
 import org.apache.ignite.internal.thread.IgniteThreadFactory;
 import org.apache.ignite.internal.util.ExceptionUtils;
 import org.apache.ignite.internal.util.IgniteSpinBusyLock;
 import org.apache.ignite.internal.util.IgniteUtils;
 import org.apache.ignite.internal.vault.VaultManager;
+import org.apache.ignite.raft.jraft.rpc.impl.RaftGroupEventsClientListener;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.TestOnly;
 
@@ -173,6 +175,9 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
     /** Failure processor that is used to handle critical errors. */
     private final FailureProcessor failureProcessor;
 
+    /** Raft group events client listener for receiving leader election notifications. */
+    private final RaftGroupEventsClientListener eventsClientListener;
+
     private final ClusterIdStore clusterIdStore;
 
     private final ClusterResetStorage clusterResetStorage;
@@ -206,6 +211,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
             ValidationManager validationManager,
             NodeAttributes nodeAttributes,
             FailureProcessor failureProcessor,
+            RaftGroupEventsClientListener eventsClientListener,
             ClusterIdStore clusterIdStore,
             RaftGroupOptionsConfigurer raftGroupOptionsConfigurer,
             MetricManager metricManager,
@@ -222,6 +228,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
                 validationManager,
                 nodeAttributes,
                 failureProcessor,
+                eventsClientListener,
                 clusterIdStore,
                 raftGroupOptionsConfigurer,
                 metricManager,
@@ -242,6 +249,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
             ValidationManager validationManager,
             NodeAttributes nodeAttributes,
             FailureProcessor failureProcessor,
+            RaftGroupEventsClientListener eventsClientListener,
             ClusterIdStore clusterIdStore,
             RaftGroupOptionsConfigurer raftGroupOptionsConfigurer,
             MetricManager metricManager,
@@ -258,6 +266,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
         this.localStateStorage = new LocalStateStorage(vault);
         this.nodeAttributes = nodeAttributes;
         this.failureProcessor = failureProcessor;
+        this.eventsClientListener = eventsClientListener;
         this.clusterIdStore = clusterIdStore;
         this.raftGroupOptionsConfigurer = raftGroupOptionsConfigurer;
         this.metricsManager = metricManager;
@@ -342,6 +351,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
             LogicalTopology logicalTopology,
             NodeAttributes nodeAttributes,
             FailureProcessor failureProcessor,
+            RaftGroupEventsClientListener eventsClientListener,
             ClusterIdStore clusterIdStore,
             RaftGroupOptionsConfigurer raftGroupOptionsConfigurer,
             MetricManager metricManager
@@ -357,6 +367,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
                 new ValidationManager(new ClusterStateStorageManager(clusterStateStorage), logicalTopology),
                 nodeAttributes,
                 failureProcessor,
+                eventsClientListener,
                 clusterIdStore,
                 raftGroupOptionsConfigurer,
                 metricManager,
@@ -376,6 +387,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
             LogicalTopology logicalTopology,
             NodeAttributes nodeAttributes,
             FailureProcessor failureProcessor,
+            RaftGroupEventsClientListener eventsClientListener,
             ClusterIdStore clusterIdStore,
             RaftGroupOptionsConfigurer raftGroupOptionsConfigurer,
             MetricManager metricManager,
@@ -393,6 +405,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
                 new ValidationManager(new ClusterStateStorageManager(clusterStateStorage), logicalTopology),
                 nodeAttributes,
                 failureProcessor,
+                eventsClientListener,
                 clusterIdStore,
                 raftGroupOptionsConfigurer,
                 metricManager,
@@ -803,7 +816,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
      * cluster state.
      */
     private CompletableFuture<Void> updateLogicalTopology(CmgRaftService service) {
-        return service.logicalTopology()
+        return service.logicalTopology(TimeAwareRaftGroupService.NO_TIMEOUT)
                 .thenCompose(logicalTopology -> inBusyLock(() -> {
                     Set<UUID> physicalTopologyIds = clusterService.topologyService().allMembers()
                             .stream()
@@ -987,7 +1000,13 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
 
             LOG.info("Starting CMG Raft service [isLearner={}, nodeNames={}, serverPeer={}]", isLearner, nodeNames, serverPeer);
 
-            RaftGroupService service = raftManager.startSystemRaftGroupNodeAndWaitNodeReady(
+            var raftServiceFactory = new PhysicalTopologyAwareRaftGroupServiceFactory(
+                    clusterService,
+                    eventsClientListener,
+                    failureProcessor
+            );
+
+            TimeAwareRaftGroupService raftGroupService = raftManager.startSystemRaftGroupNodeAndWaitNodeReadyTimeAware(
                     raftNodeId(serverPeer),
                     raftConfiguration,
                     new CmgRaftGroupListener(
@@ -1000,11 +1019,11 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
                             onConfigurationCommittedListener
                     ),
                     this::onElectedAsLeader,
-                    null,
+                    raftServiceFactory,
                     raftGroupOptionsConfigurer
             );
 
-            return new CmgRaftService(service, clusterService.topologyService(), logicalTopology);
+            return new CmgRaftService(raftGroupService, clusterService.topologyService(), logicalTopology);
         } catch (NodeStoppingException e) {
             throw new IgniteInternalException(NODE_STOPPING_ERR, e);
         } finally {
@@ -1099,7 +1118,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
     }
 
     private void sendClusterState(CmgRaftService raftService, Collection<InternalClusterNode> nodes) {
-        raftService.logicalTopology()
+        raftService.logicalTopology(TimeAwareRaftGroupService.NO_TIMEOUT)
                 .thenCompose(topology -> {
                     // TODO https://issues.apache.org/jira/browse/IGNITE-24769
                     Set<InternalClusterNode> logicalTopology = topology.nodes().stream()
@@ -1243,7 +1262,17 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
      * @return Future that, when complete, resolves into a list of node names that host the Meta Storage.
      */
     public CompletableFuture<Set<String>> metaStorageNodes() {
-        return metaStorageInfo()
+        return metaStorageNodes(TimeAwareRaftGroupService.NO_TIMEOUT);
+    }
+
+    /**
+     * Returns a future that, when complete, resolves into a list of node names that host the Meta Storage.
+     *
+     * @param timeout Timeout in milliseconds. Use {@link TimeAwareRaftGroupService#NO_TIMEOUT} for infinite wait.
+     * @return Future that, when complete, resolves into a list of node names that host the Meta Storage.
+     */
+    public CompletableFuture<Set<String>> metaStorageNodes(long timeout) {
+        return metaStorageInfo(timeout)
                 .thenApply(MetaStorageInfo::metaStorageNodes);
     }
 
@@ -1251,13 +1280,22 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
      * Returns a future that, when complete, resolves into a Meta storage info.
      */
     public CompletableFuture<MetaStorageInfo> metaStorageInfo() {
+        return metaStorageInfo(TimeAwareRaftGroupService.NO_TIMEOUT);
+    }
+
+    /**
+     * Returns a future that, when complete, resolves into a Meta storage info.
+     *
+     * @param timeout Timeout in milliseconds. Use {@link TimeAwareRaftGroupService#NO_TIMEOUT} for infinite wait.
+     */
+    public CompletableFuture<MetaStorageInfo> metaStorageInfo(long timeout) {
         if (!busyLock.enterBusy()) {
             return failedFuture(new NodeStoppingException());
         }
 
         try {
             return raftServiceAfterJoin()
-                    .thenCompose(CmgRaftService::readMetaStorageInfo);
+                    .thenCompose(service -> service.readMetaStorageInfo(timeout));
         } finally {
             busyLock.leaveBusy();
         }
@@ -1306,12 +1344,22 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
      * @return Future that, when complete, resolves into a logical topology snapshot.
      */
     public CompletableFuture<LogicalTopologySnapshot> logicalTopology() {
+        return logicalTopology(TimeAwareRaftGroupService.NO_TIMEOUT);
+    }
+
+    /**
+     * Returns a future that, when complete, resolves into a logical topology snapshot.
+     *
+     * @param timeout Timeout in milliseconds. Use {@link TimeAwareRaftGroupService#NO_TIMEOUT} for infinite wait.
+     * @return Future that, when complete, resolves into a logical topology snapshot.
+     */
+    public CompletableFuture<LogicalTopologySnapshot> logicalTopology(long timeout) {
         if (!busyLock.enterBusy()) {
             return failedFuture(new NodeStoppingException());
         }
 
         try {
-            return raftServiceAfterJoin().thenCompose(CmgRaftService::logicalTopology);
+            return raftServiceAfterJoin().thenCompose(service -> service.logicalTopology(timeout));
         } finally {
             busyLock.leaveBusy();
         }
@@ -1322,12 +1370,22 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
      * Logical Topology as well as nodes that only have passed the validation step.
      */
     public CompletableFuture<Set<InternalClusterNode>> validatedNodes() {
+        return validatedNodes(TimeAwareRaftGroupService.NO_TIMEOUT);
+    }
+
+    /**
+     * Returns a future that, when complete, resolves into a list of validated nodes. This list includes all nodes currently present in the
+     * Logical Topology as well as nodes that only have passed the validation step.
+     *
+     * @param timeout Timeout in milliseconds. Use {@link TimeAwareRaftGroupService#NO_TIMEOUT} for infinite wait.
+     */
+    public CompletableFuture<Set<InternalClusterNode>> validatedNodes(long timeout) {
         if (!busyLock.enterBusy()) {
             return failedFuture(new NodeStoppingException());
         }
 
         try {
-            return raftServiceAfterJoin().thenCompose(CmgRaftService::validatedNodes);
+            return raftServiceAfterJoin().thenCompose(service -> service.validatedNodes(timeout));
         } finally {
             busyLock.leaveBusy();
         }
@@ -1358,7 +1416,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
      * @return Future that completes when the command is executed by the CMG.
      */
     public CompletableFuture<Void> changeMetastorageNodes(Set<String> newMetastorageNodes) {
-        return changeMetastorageNodesInternal(newMetastorageNodes, null);
+        return changeMetastorageNodesInternal(newMetastorageNodes, null, TimeAwareRaftGroupService.NO_TIMEOUT);
     }
 
     /**
@@ -1370,12 +1428,30 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
      * @return Future that completes when the command is executed by the CMG.
      */
     public CompletableFuture<Void> changeMetastorageNodes(Set<String> newMetastorageNodes, long metastorageRepairingConfigIndex) {
-        return changeMetastorageNodesInternal(newMetastorageNodes, metastorageRepairingConfigIndex);
+        return changeMetastorageNodesInternal(newMetastorageNodes, metastorageRepairingConfigIndex, TimeAwareRaftGroupService.NO_TIMEOUT);
+    }
+
+    /**
+     * Changes metastorage nodes in the CMG for the forceful (with repair) Metastorage reconfiguration procedure.
+     *
+     * @param newMetastorageNodes Metastorage node names to set.
+     * @param metastorageRepairingConfigIndex Raft index in the Metastorage group under which the forced configuration is
+     *     (or will be) saved.
+     * @param timeout Timeout in milliseconds. Use {@link TimeAwareRaftGroupService#NO_TIMEOUT} for infinite wait.
+     * @return Future that completes when the command is executed by the CMG.
+     */
+    public CompletableFuture<Void> changeMetastorageNodes(
+            Set<String> newMetastorageNodes,
+            long metastorageRepairingConfigIndex,
+            long timeout
+    ) {
+        return changeMetastorageNodesInternal(newMetastorageNodes, metastorageRepairingConfigIndex, timeout);
     }
 
     private CompletableFuture<Void> changeMetastorageNodesInternal(
             Set<String> newMetastorageNodes,
-            @Nullable Long metastorageRepairingConfigIndex
+            @Nullable Long metastorageRepairingConfigIndex,
+            long timeout
     ) {
         if (!busyLock.enterBusy()) {
             return failedFuture(new NodeStoppingException());
@@ -1383,7 +1459,7 @@ public class ClusterManagementGroupManager extends AbstractEventProducer<Cluster
 
         try {
             return raftServiceAfterJoin()
-                    .thenCompose(service -> service.changeMetastorageNodes(newMetastorageNodes, metastorageRepairingConfigIndex));
+                    .thenCompose(service -> service.changeMetastorageNodes(newMetastorageNodes, metastorageRepairingConfigIndex, timeout));
         } finally {
             busyLock.leaveBusy();
         }

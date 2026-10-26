@@ -58,8 +58,7 @@ import org.apache.ignite.internal.metastorage.dsl.Iif;
 import org.apache.ignite.internal.metastorage.dsl.Operation;
 import org.apache.ignite.internal.metastorage.dsl.StatementResult;
 import org.apache.ignite.internal.raft.ReadCommand;
-import org.apache.ignite.internal.raft.service.RaftCommandRunner;
-import org.apache.ignite.internal.raft.service.RaftGroupService;
+import org.apache.ignite.internal.raft.service.TimeAwareRaftGroupService;
 import org.apache.ignite.internal.thread.IgniteThreadFactory;
 import org.apache.ignite.internal.util.IgniteSpinBusyLock;
 import org.apache.ignite.internal.util.IgniteUtils;
@@ -87,7 +86,7 @@ public class MetaStorageServiceImpl implements MetaStorageService {
      */
     public MetaStorageServiceImpl(
             String nodeName,
-            RaftGroupService metaStorageRaftGrpSvc,
+            TimeAwareRaftGroupService metaStorageRaftGrpSvc,
             IgniteSpinBusyLock busyLock,
             HybridClock clock,
             UUID localNodeId
@@ -104,88 +103,89 @@ public class MetaStorageServiceImpl implements MetaStorageService {
         this.commandIdGenerator = new CommandIdGenerator(localNodeId);
     }
 
-    public RaftGroupService raftGroupService() {
+    public TimeAwareRaftGroupService raftGroupService() {
         return context.raftService();
     }
 
     @Override
-    public CompletableFuture<Entry> get(ByteArray key) {
-        return get(key, MetaStorageManager.LATEST_REVISION);
+    public CompletableFuture<Entry> get(ByteArray key, long timeoutMillis) {
+        return get(key, MetaStorageManager.LATEST_REVISION, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<Entry> get(ByteArray key, long revUpperBound) {
+    public CompletableFuture<Entry> get(ByteArray key, long revUpperBound, long timeoutMillis) {
         GetCommand getCommand = context.commandsFactory().getCommand().key(ByteBuffer.wrap(key.bytes())).revision(revUpperBound).build();
 
-        return context.raftService().run(getCommand);
+        return context.raftService().run(getCommand, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<Map<ByteArray, Entry>> getAll(Set<ByteArray> keys) {
-        return getAll(keys, MetaStorageManager.LATEST_REVISION);
+    public CompletableFuture<Map<ByteArray, Entry>> getAll(Set<ByteArray> keys, long timeoutMillis) {
+        return getAll(keys, MetaStorageManager.LATEST_REVISION, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<Map<ByteArray, Entry>> getAll(Set<ByteArray> keys, long revUpperBound) {
+    public CompletableFuture<Map<ByteArray, Entry>> getAll(Set<ByteArray> keys, long revUpperBound, long timeoutMillis) {
         GetAllCommand getAllCommand = getAllCommand(context.commandsFactory(), keys, revUpperBound);
 
-        return context.raftService().<List<Entry>>run(getAllCommand)
+        return context.raftService().<List<Entry>>run(getAllCommand, timeoutMillis)
                 .thenApply(MetaStorageServiceImpl::multipleEntryResult);
     }
 
     @Override
-    public CompletableFuture<Void> put(ByteArray key, byte[] value) {
+    public CompletableFuture<Void> put(ByteArray key, byte[] value, long timeoutMillis) {
         PutCommand putCommand = context.commandsFactory().putCommand()
                 .key(ByteBuffer.wrap(key.bytes()))
                 .value(ByteBuffer.wrap(value))
                 .initiatorTime(clock.now())
                 .build();
 
-        return context.raftService().run(putCommand);
+        return context.raftService().run(putCommand, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<Void> putAll(Map<ByteArray, byte[]> vals) {
+    public CompletableFuture<Void> putAll(Map<ByteArray, byte[]> vals, long timeoutMillis) {
         PutAllCommand putAllCommand = putAllCommand(context.commandsFactory(), vals, clock.now());
 
-        return context.raftService().run(putAllCommand);
+        return context.raftService().run(putAllCommand, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<Void> remove(ByteArray key) {
+    public CompletableFuture<Void> remove(ByteArray key, long timeoutMillis) {
         RemoveCommand removeCommand = context.commandsFactory().removeCommand().key(ByteBuffer.wrap(key.bytes()))
                 .initiatorTime(clock.now()).build();
 
-        return context.raftService().run(removeCommand);
+        return context.raftService().run(removeCommand, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<Void> removeAll(Set<ByteArray> keys) {
+    public CompletableFuture<Void> removeAll(Set<ByteArray> keys, long timeoutMillis) {
         RemoveAllCommand removeAllCommand = removeAllCommand(context.commandsFactory(), keys, clock.now());
 
-        return context.raftService().run(removeAllCommand);
+        return context.raftService().run(removeAllCommand, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<Void> removeByPrefix(ByteArray prefix) {
+    public CompletableFuture<Void> removeByPrefix(ByteArray prefix, long timeoutMillis) {
         RemoveByPrefixCommand removeByPrefix = context.commandsFactory().removeByPrefixCommand()
                 .prefix(ByteBuffer.wrap(prefix.bytes()))
                 .initiatorTime(clock.now())
                 .build();
 
-        return context.raftService().run(removeByPrefix);
+        return context.raftService().run(removeByPrefix, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<Boolean> invoke(Condition condition, Operation success, Operation failure) {
-        return invoke(condition, List.of(success), List.of(failure));
+    public CompletableFuture<Boolean> invoke(Condition condition, Operation success, Operation failure, long timeoutMillis) {
+        return invoke(condition, List.of(success), List.of(failure), timeoutMillis);
     }
 
     @Override
     public CompletableFuture<Boolean> invoke(
             Condition condition,
             List<Operation> success,
-            List<Operation> failure
+            List<Operation> failure,
+            long timeoutMillis
     ) {
         InvokeCommand invokeCommand = context.commandsFactory().invokeCommand()
                 .condition(condition)
@@ -195,33 +195,33 @@ public class MetaStorageServiceImpl implements MetaStorageService {
                 .id(commandIdGenerator.newId())
                 .build();
 
-        return context.raftService().run(invokeCommand);
+        return context.raftService().run(invokeCommand, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<StatementResult> invoke(Iif iif) {
+    public CompletableFuture<StatementResult> invoke(Iif iif, long timeoutMillis) {
         MultiInvokeCommand multiInvokeCommand = context.commandsFactory().multiInvokeCommand()
                 .iif(iif)
                 .initiatorTime(clock.now())
                 .id(commandIdGenerator.newId())
                 .build();
 
-        return context.raftService().run(multiInvokeCommand);
+        return context.raftService().run(multiInvokeCommand, timeoutMillis);
     }
 
     @Override
-    public Publisher<Entry> range(ByteArray keyFrom, @Nullable ByteArray keyTo, long revUpperBound) {
-        return range(keyFrom, keyTo, revUpperBound, false);
+    public Publisher<Entry> range(ByteArray keyFrom, @Nullable ByteArray keyTo, long revUpperBound, long timeoutMillis) {
+        return range(keyFrom, keyTo, revUpperBound, false, timeoutMillis);
     }
 
     @Override
-    public Publisher<Entry> range(ByteArray keyFrom, @Nullable ByteArray keyTo) {
-        return range(keyFrom, keyTo, false);
+    public Publisher<Entry> range(ByteArray keyFrom, @Nullable ByteArray keyTo, long timeoutMillis) {
+        return range(keyFrom, keyTo, false, timeoutMillis);
     }
 
     @Override
-    public Publisher<Entry> range(ByteArray keyFrom, @Nullable ByteArray keyTo, boolean includeTombstones) {
-        return range(keyFrom, keyTo, MetaStorageManager.LATEST_REVISION, includeTombstones);
+    public Publisher<Entry> range(ByteArray keyFrom, @Nullable ByteArray keyTo, boolean includeTombstones, long timeoutMillis) {
+        return range(keyFrom, keyTo, MetaStorageManager.LATEST_REVISION, includeTombstones, timeoutMillis);
     }
 
     @Override
@@ -229,7 +229,8 @@ public class MetaStorageServiceImpl implements MetaStorageService {
             ByteArray keyFrom,
             @Nullable ByteArray keyTo,
             long revUpperBound,
-            boolean includeTombstones
+            boolean includeTombstones,
+            long timeoutMillis
     ) {
         Function<byte[], ReadCommand> getRangeCommand = prevKey -> context.commandsFactory().getRangeCommand()
                 .keyFrom(ByteBuffer.wrap(keyFrom.bytes()))
@@ -240,11 +241,11 @@ public class MetaStorageServiceImpl implements MetaStorageService {
                 .batchSize(BATCH_SIZE)
                 .build();
 
-        return new CursorPublisher(context, getRangeCommand);
+        return new CursorPublisher(context, getRangeCommand, timeoutMillis);
     }
 
     @Override
-    public Publisher<Entry> prefix(ByteArray prefix, long revUpperBound) {
+    public Publisher<Entry> prefix(ByteArray prefix, long revUpperBound, long timeoutMillis) {
         Function<byte[], ReadCommand> getPrefixCommand = prevKey -> context.commandsFactory().getPrefixCommand()
                 .prefix(ByteBuffer.wrap(prefix.bytes()))
                 .revUpperBound(revUpperBound)
@@ -253,7 +254,7 @@ public class MetaStorageServiceImpl implements MetaStorageService {
                 .batchSize(BATCH_SIZE)
                 .build();
 
-        return new CursorPublisher(context, getPrefixCommand);
+        return new CursorPublisher(context, getPrefixCommand, timeoutMillis);
     }
 
     /**
@@ -262,29 +263,29 @@ public class MetaStorageServiceImpl implements MetaStorageService {
      * @param safeTime New safe time.
      * @return Future that will be completed when message is sent.
      */
-    CompletableFuture<Void> syncTime(HybridTimestamp safeTime, long term) {
+    CompletableFuture<Void> syncTime(HybridTimestamp safeTime, long term, long timeoutMillis) {
         SyncTimeCommand syncTimeCommand = context.commandsFactory().syncTimeCommand()
                 .initiatorTime(safeTime)
                 .initiatorTerm(term)
                 .build();
 
-        return context.raftService().run(syncTimeCommand);
+        return context.raftService().run(syncTimeCommand, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<RevisionsInfo> currentRevisions() {
+    public CompletableFuture<RevisionsInfo> currentRevisions(long timeoutMillis) {
         GetCurrentRevisionsCommand cmd = context.commandsFactory().getCurrentRevisionsCommand().build();
 
-        return context.raftService().run(cmd, RaftCommandRunner.NO_TIMEOUT);
+        return context.raftService().run(cmd, timeoutMillis);
     }
 
     @Override
-    public CompletableFuture<ChecksumInfo> checksum(long revision) {
+    public CompletableFuture<ChecksumInfo> checksum(long revision, long timeoutMillis) {
         GetChecksumCommand cmd = context.commandsFactory().getChecksumCommand()
                 .revision(revision)
                 .build();
 
-        return context.raftService().run(cmd);
+        return context.raftService().run(cmd, timeoutMillis);
     }
 
     /**
@@ -293,14 +294,14 @@ public class MetaStorageServiceImpl implements MetaStorageService {
      * @param evictionTimestamp Cached entries older than given timestamp will be evicted.
      * @return Pending operation future.
      */
-    CompletableFuture<Void> evictIdempotentCommandsCache(HybridTimestamp evictionTimestamp) {
+    CompletableFuture<Void> evictIdempotentCommandsCache(HybridTimestamp evictionTimestamp, long timeoutMillis) {
         EvictIdempotentCommandsCacheCommand evictIdempotentCommandsCacheCommand = evictIdempotentCommandsCacheCommand(
                 context.commandsFactory(),
                 evictionTimestamp,
                 clock.now()
         );
 
-        return context.raftService().run(evictIdempotentCommandsCacheCommand);
+        return context.raftService().run(evictIdempotentCommandsCacheCommand, timeoutMillis);
     }
 
     @Override
@@ -389,12 +390,12 @@ public class MetaStorageServiceImpl implements MetaStorageService {
      * @param compactionRevision New metastorage compaction revision.
      * @return Operation future.
      */
-    CompletableFuture<Void> sendCompactionCommand(long compactionRevision) {
+    CompletableFuture<Void> sendCompactionCommand(long compactionRevision, long timeoutMillis) {
         CompactionCommand command = context.commandsFactory().compactionCommand()
                 .compactionRevision(compactionRevision)
                 .initiatorTime(clock.now())
                 .build();
 
-        return context.raftService().run(command);
+        return context.raftService().run(command, timeoutMillis);
     }
 }

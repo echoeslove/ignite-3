@@ -1,0 +1,86 @@
+{
+  "cluster-management/test": {
+    "classes": 17,
+    "tests": 99,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "cluster-management/integrationTest": {
+    "classes": 1,
+    "tests": 9,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "transactions/test": {
+    "classes": 3,
+    "tests": 65,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "placement-driver/integrationTest": {
+    "classes": 1,
+    "tests": 1,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "metastorage/test": {
+    "classes": 26,
+    "tests": 371,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "metastorage/integrationTest": {
+    "classes": 6,
+    "tests": 48,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 2
+  },
+  "raft/test": {
+    "classes": 2,
+    "tests": 51,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "raft/integrationTest": {
+    "classes": 1,
+    "tests": 3,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "partition-replicator/test": {
+    "classes": 1,
+    "tests": 2,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "partition-replicator/integrationTest": {
+    "classes": 2,
+    "tests": 6,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "failure-handler/test": {
+    "classes": 5,
+    "tests": 22,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "failure-handler/integrationTest": {
+    "classes": 1,
+    "tests": 2,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  }
+}

@@ -22,14 +22,17 @@ import static org.apache.ignite.internal.metastorage.dsl.Operations.ops;
 import static org.apache.ignite.internal.metastorage.dsl.Operations.put;
 import static org.apache.ignite.internal.metastorage.dsl.Statements.iif;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.Serializable;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
@@ -56,6 +59,9 @@ import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Tests for idempotency of {@link org.apache.ignite.internal.metastorage.command.IdempotentCommand}.
@@ -179,6 +185,49 @@ public class IdempotentCommandCacheTest extends BaseIgniteAbstractTest {
 
         assertNull(lastCommandResult);
         checkValueInStorage(testKey.bytes(), testValue1.bytes());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void multiInvokeResultSurvivesSnapshot(boolean expected, @TempDir Path snapshotPath) {
+        ByteArray key = new ByteArray("snapshot-key");
+        byte[] value = {1};
+        MultiInvokeCommand command = CMD_FACTORY.multiInvokeCommand()
+                .id(commandIdGenerator.newId())
+                .iif(iif(notExists(key), ops(put(key, value)).yield(expected), ops(put(key, new byte[]{2})).yield(!expected)))
+                .safeTime(clock.now())
+                .initiatorTime(clock.now())
+                .build();
+
+        metaStorageListener.onWrite(commandIterator(command));
+        storage.snapshot(snapshotPath).join();
+
+        storage = new SimpleInMemoryKeyValueStorage(NODE_NAME);
+        metaStorageListener = new MetaStorageListener(storage, clock, new ClusterTimeImpl(NODE_NAME, new IgniteSpinBusyLock(), clock));
+        assertTrue(metaStorageListener.onSnapshotLoad(snapshotPath));
+        metaStorageListener.onWrite(commandIterator(command));
+
+        assertEquals(expected, ((StatementResult) lastCommandResult).getAsBoolean());
+        checkValueInStorage(key.bytes(), value);
+    }
+
+    @Test
+    void retryDoesNotMutatePreviouslyPreparedCommand() {
+        PutCommand original = CMD_FACTORY.putCommand()
+                .key(ByteBuffer.wrap(new byte[]{1}))
+                .value(ByteBuffer.wrap(new byte[]{2}))
+                .safeTime(clock.now())
+                .initiatorTime(clock.now())
+                .build();
+        var originalTime = original.safeTime();
+        PutCommand first = (PutCommand) metaStorageListener.onBeforeApply(original);
+        var firstTime = first.safeTime();
+        PutCommand second = (PutCommand) metaStorageListener.onBeforeApply(original);
+
+        assertNotSame(original, first);
+        assertNotSame(first, second);
+        assertEquals(originalTime, original.safeTime());
+        assertEquals(firstTime, first.safeTime());
     }
 
     private void checkValueInStorage(byte[] testKey, byte[] testValueExpected) {

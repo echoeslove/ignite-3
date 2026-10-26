@@ -82,7 +82,7 @@ import org.apache.ignite.internal.raft.RaftGroupOptionsConfigurer;
 import org.apache.ignite.internal.raft.TestLozaFactory;
 import org.apache.ignite.internal.raft.client.TopologyAwareRaftGroupServiceFactory;
 import org.apache.ignite.internal.raft.configuration.RaftConfiguration;
-import org.apache.ignite.internal.raft.service.RaftGroupService;
+import org.apache.ignite.internal.raft.service.TimeAwareRaftGroupService;
 import org.apache.ignite.internal.raft.storage.LogStorageFactory;
 import org.apache.ignite.internal.raft.util.SharedLogStorageFactoryUtils;
 import org.apache.ignite.internal.replicator.PartitionGroupId;
@@ -259,12 +259,11 @@ public class MultiActorPlacementDriverTest extends BasePlacementDriverTest {
 
             logicalTopManagers.add(logicalTopologyService);
 
-            TopologyAwareRaftGroupServiceFactory topologyAwareRaftGroupServiceFactory = new TopologyAwareRaftGroupServiceFactory(
-                    clusterService,
-                    logicalTopologyService,
-                    Loza.FACTORY,
-                    eventsClientListener
-            );
+            var topologyAwareRaftGroupServiceFactory = new TopologyAwareRaftGroupServiceFactory(
+                    clusterService, logicalTopologyService, Loza.FACTORY, eventsClientListener);
+
+            var msRaftServiceFactory = new org.apache.ignite.internal.cluster.management.raft.PhysicalTopologyAwareRaftGroupServiceFactory(
+                    clusterService, eventsClientListener, mock(FailureProcessor.class));
 
             HybridClock nodeClock = new HybridClockImpl();
 
@@ -303,7 +302,7 @@ public class MultiActorPlacementDriverTest extends BasePlacementDriverTest {
                     raftManager,
                     storage,
                     nodeClock,
-                    topologyAwareRaftGroupServiceFactory,
+                    msRaftServiceFactory,
                     new NoOpMetricManager(),
                     systemDistributedConfiguration,
                     msRaftConfigurer,
@@ -392,14 +391,14 @@ public class MultiActorPlacementDriverTest extends BasePlacementDriverTest {
 
         Lease lease = checkLeaseCreated(grpPart0, true);
 
-        CompletableFuture<RaftGroupService> msRaftClientFuture = metaStorageManager.metaStorageService()
+        CompletableFuture<TimeAwareRaftGroupService> msRaftClientFuture = metaStorageManager.metaStorageService()
                 .thenApply(MetaStorageServiceImpl::raftGroupService);
 
         assertThat(msRaftClientFuture, willCompleteSuccessfully());
 
-        RaftGroupService msRaftClient = msRaftClientFuture.join();
+        TimeAwareRaftGroupService msRaftClient = msRaftClientFuture.join();
 
-        assertThat(msRaftClient.refreshLeader(), willCompleteSuccessfully());
+        assertThat(msRaftClient.refreshLeader(TimeAwareRaftGroupService.NO_TIMEOUT), willCompleteSuccessfully());
 
         Peer previousLeader = msRaftClient.leader();
 
@@ -407,9 +406,11 @@ public class MultiActorPlacementDriverTest extends BasePlacementDriverTest {
 
         log.info("The placement driver group active actor is transferring [from={}, to={}]", previousLeader, newLeader);
 
-        assertThat(msRaftClient.transferLeadership(newLeader), willCompleteSuccessfully());
+        assertThat(msRaftClient.transferLeadership(newLeader, TimeAwareRaftGroupService.NO_TIMEOUT), willCompleteSuccessfully());
 
         waitForProlong(grpPart0, lease);
+
+        assertThat(msRaftClient.refreshLeader(TimeAwareRaftGroupService.NO_TIMEOUT), willCompleteSuccessfully());
 
         assertEquals(newLeader, msRaftClient.leader());
     }

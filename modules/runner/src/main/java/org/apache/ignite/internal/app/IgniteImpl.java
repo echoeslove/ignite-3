@@ -83,6 +83,7 @@ import org.apache.ignite.internal.cluster.management.NodeAttributesCollector;
 import org.apache.ignite.internal.cluster.management.configuration.NodeAttributesExtensionConfiguration;
 import org.apache.ignite.internal.cluster.management.raft.ClusterStateStorage;
 import org.apache.ignite.internal.cluster.management.raft.ClusterStateStorageManager;
+import org.apache.ignite.internal.cluster.management.raft.PhysicalTopologyAwareRaftGroupServiceFactory;
 import org.apache.ignite.internal.cluster.management.raft.RocksDbClusterStateStorage;
 import org.apache.ignite.internal.cluster.management.raft.ValidationManager;
 import org.apache.ignite.internal.cluster.management.topology.LogicalTopologyImpl;
@@ -589,7 +590,7 @@ public class IgniteImpl implements Ignite {
 
         FailureProcessorConfiguration failureProcessorConfiguration = nodeConfigRegistry.getConfiguration(
                 FailureProcessorExtensionConfiguration.KEY).failureHandler();
-        failureManager = new FailureManager(node::shutdown, failureProcessorConfiguration);
+        failureManager = new FailureManager(name, node::shutdown, failureProcessorConfiguration);
         if (Boolean.getBoolean("ignite.staleRecovery.enabled")) {
             failureManager.withStaleNodeRecovery(new org.apache.ignite.internal.failure.StaleNodeRecovery(
                     // Bind the stopper to THIS instance: an old callback must not shut down a replacement through the server facade.
@@ -751,6 +752,7 @@ public class IgniteImpl implements Ignite {
                 validationManager,
                 nodeAttributesCollector,
                 failureManager,
+                raftGroupEventsClientListener,
                 clusterIdService,
                 cmgRaftConfigurer,
                 metricManager,
@@ -764,6 +766,10 @@ public class IgniteImpl implements Ignite {
                 logicalTopologyService,
                 Loza.FACTORY,
                 raftGroupEventsClientListener
+        );
+
+        var msRaftGroupServiceFactory = new PhysicalTopologyAwareRaftGroupServiceFactory(
+                clusterSvc, raftGroupEventsClientListener, failureManager
         );
 
         var readOperationForCompactionTracker = new ReadOperationForCompactionTracker();
@@ -783,7 +789,7 @@ public class IgniteImpl implements Ignite {
                 raftMgr,
                 storage,
                 clock,
-                topologyAwareRaftGroupServiceFactory,
+                msRaftGroupServiceFactory,
                 metricManager,
                 systemDisasterRecoveryStorage,
                 new MetastorageRepairImpl(clusterSvc.messagingService(), logicalTopology, cmgMgr),

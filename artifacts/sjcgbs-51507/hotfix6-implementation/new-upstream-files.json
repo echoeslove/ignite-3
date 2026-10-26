@@ -1,0 +1,20 @@
+{
+  "ref": "4facea77b6",
+  "new_files": [
+    "modules/raft-api/src/main/java/org/apache/ignite/internal/raft/ReplicationGroupUnavailableException.java",
+    "modules/raft-api/src/main/java/org/apache/ignite/internal/raft/service/TimeAwareRaftGroupService.java",
+    "modules/raft-api/src/main/java/org/apache/ignite/internal/raft/TimeAwareRaftGroupServiceFactory.java",
+    "modules/cluster-management/src/main/java/org/apache/ignite/internal/cluster/management/raft/PhysicalTopologyAwareRaftGroupServiceFactory.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/PhysicalTopologyAwareRaftGroupService.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/RetryContext.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/LeaderAvailabilityState.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/RaftCommandExecutor.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/RaftErrorUtils.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/PeerTracking.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/RaftPeerUtils.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/RetryExecutionStrategy.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/RetryPeerResult.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/SubscriptionMessageSender.java",
+    "modules/raft/src/main/java/org/apache/ignite/internal/raft/client/TargetPeerStrategy.java"
+  ]
+}

@@ -327,6 +327,20 @@ public final class Utils {
         return IgniteUtils.monotonicMs();
     }
 
+    /** Returns a saturated monotonic deadline after the given interval in milliseconds. */
+    public static long monotonicMsAfter(long timeoutMillis) {
+        if (timeoutMillis == Long.MAX_VALUE || timeoutMillis < 0) {
+            // Infinite retry.
+            return Long.MAX_VALUE;
+        }
+        long now = monotonicMs();
+        // Overflow check: if now + timeoutMillis would overflow, return MAX_VALUE.
+        if (timeoutMillis > Long.MAX_VALUE - now) {
+            return Long.MAX_VALUE;
+        }
+        return now + timeoutMillis;
+    }
+
     /**
      * Returns the current time in milliseconds, it's not monotonic, would be forwarded/backward by clock synchronous.
      */
