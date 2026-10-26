@@ -160,4 +160,3 @@ class TxFinishReplicaRequestHandlerTest extends BaseIgniteAbstractTest {
                 .build();
     }
 }
-

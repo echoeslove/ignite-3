@@ -48,7 +48,7 @@
     "modules/partition-replicator/src/main/java/org/apache/ignite/internal/partition/replicator/handlers/TxFinishReplicaRequestHandler.java": "4654dacf1645180fe04de1b3934a041a0ac234e7e8b088b2034760aa9c39668f",
     "modules/partition-replicator/src/main/java/org/apache/ignite/internal/partition/replicator/raft/UnexpectedTransactionStateException.java": "DELETED",
     "modules/partition-replicator/src/main/java/org/apache/ignite/internal/partition/replicator/raft/handlers/FinishTxCommandHandler.java": "441483c0873ab72d19e8434c79776e1f4bc2a3c016cf3772940eb429968a30f2",
-    "modules/partition-replicator/src/test/java/org/apache/ignite/internal/partition/replicator/handlers/TxFinishReplicaRequestHandlerTest.java": "ff1957a677e29e84cde49ddc7a60b91339eb01c61c9e2552d6060fad3b67337f",
+    "modules/partition-replicator/src/test/java/org/apache/ignite/internal/partition/replicator/handlers/TxFinishReplicaRequestHandlerTest.java": "2dbc99edf064b4638254233a7b98037fca6ce6aa2f614e9419d99e1ee85d5acd",
     "modules/placement-driver/src/integrationTest/java/org/apache/ignite/internal/placementdriver/MultiActorPlacementDriverTest.java": "7a23f23a24c45c663c4de9b455ade07d77bfb2b4c45192a143de50c95aabe5d1",
     "modules/placement-driver/src/integrationTest/java/org/apache/ignite/internal/placementdriver/PlacementDriverManagerTest.java": "c20e6670be86628ec6c01f43b87bccc8cf49177b091b3f612848fa3eeed04ffb",
     "modules/raft-api/src/main/java/org/apache/ignite/internal/raft/RaftManager.java": "813ff997b6cb2fc7a055d683bce6b7d0a53c6269745a765cdd7fdaba2791110f",
