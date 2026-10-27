@@ -202,7 +202,7 @@ public class RepeatedFinishClientTransactionTest extends BaseIgniteAbstractTest 
     }
 
     @Test
-    public void testEnlistFailAfterCommit() {
+    public void testEnlistFailAfterCommit() throws Exception {
         ReliableChannel ch = mock(ReliableChannel.class, Mockito.RETURNS_DEEP_STUBS);
 
         TestClientChannel clientChannel = mock(TestClientChannel.class, Mockito.RETURNS_DEEP_STUBS);
@@ -230,10 +230,13 @@ public class RepeatedFinishClientTransactionTest extends BaseIgniteAbstractTest 
         } catch (TransactionException e) {
             assertEquals(Transactions.TX_ALREADY_FINISHED_ERR, e.code());
         }
+
+        // A rejected enlistment must not hold the read lock and block a later finish on another thread.
+        CompletableFuture.runAsync(tx::rollback).get(3, TimeUnit.SECONDS);
     }
 
     @Test
-    public void testEnlistFailAfterRollback() {
+    public void testEnlistFailAfterRollback() throws Exception {
         ReliableChannel ch = mock(ReliableChannel.class, Mockito.RETURNS_DEEP_STUBS);
 
         TestClientChannel clientChannel = mock(TestClientChannel.class, Mockito.RETURNS_DEEP_STUBS);
@@ -261,6 +264,8 @@ public class RepeatedFinishClientTransactionTest extends BaseIgniteAbstractTest 
         } catch (TransactionException e) {
             assertEquals(Transactions.TX_ALREADY_FINISHED_ERR, e.code());
         }
+
+        CompletableFuture.runAsync(tx::commit).get(3, TimeUnit.SECONDS);
     }
 
     private static class TestClientChannel implements ClientChannel {

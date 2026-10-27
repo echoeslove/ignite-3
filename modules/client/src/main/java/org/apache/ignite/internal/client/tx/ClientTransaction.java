@@ -365,22 +365,25 @@ public class ClientTransaction implements Transaction {
             throw new TransactionException(TX_ALREADY_FINISHED_ERR, format("Transaction is already finished [tx={}].", this));
         }
 
-        checkEnlistPossible();
-
         boolean[] first = {false};
+        CompletableFuture<IgniteBiTuple<String, Long>> fut;
 
-        TablePartitionId tablePartitionId = new TablePartitionId(pm.tableId(), pm.partition());
+        try {
+            checkEnlistPossible();
 
-        CompletableFuture<IgniteBiTuple<String, Long>> fut = enlisted.compute(tablePartitionId, (k, v) -> {
-            if (v == null) {
-                first[0] = true;
-                return new CompletableFuture<>();
-            } else {
-                return v;
-            }
-        });
+            TablePartitionId tablePartitionId = new TablePartitionId(pm.tableId(), pm.partition());
 
-        enlistPartitionLock.readLock().unlock();
+            fut = enlisted.compute(tablePartitionId, (k, v) -> {
+                if (v == null) {
+                    first[0] = true;
+                    return new CompletableFuture<>();
+                } else {
+                    return v;
+                }
+            });
+        } finally {
+            enlistPartitionLock.readLock().unlock();
+        }
 
         // Re-check after unlock.
         checkEnlistPossible();
