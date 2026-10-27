@@ -197,7 +197,6 @@ import org.apache.ignite.internal.partition.replicator.network.PartitionReplicat
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.outgoing.OutgoingSnapshotsManager;
 import org.apache.ignite.internal.placementdriver.PlacementDriver;
 import org.apache.ignite.internal.placementdriver.PlacementDriverManager;
-import org.apache.ignite.internal.placementdriver.PrimaryDistributionManager;
 import org.apache.ignite.internal.raft.Loza;
 import org.apache.ignite.internal.raft.Marshaller;
 import org.apache.ignite.internal.raft.RaftGroupOptionsConfigurer;
@@ -227,7 +226,6 @@ import org.apache.ignite.internal.rest.configuration.PresentationsFactory;
 import org.apache.ignite.internal.rest.configuration.RestConfiguration;
 import org.apache.ignite.internal.rest.configuration.RestExtensionConfiguration;
 import org.apache.ignite.internal.rest.deployment.CodeDeploymentRestFactory;
-import org.apache.ignite.internal.rest.distribution.DistributionRestFactory;
 import org.apache.ignite.internal.rest.metrics.MetricRestFactory;
 import org.apache.ignite.internal.rest.node.NodeManagementRestFactory;
 import org.apache.ignite.internal.rest.node.NodePropertiesFactory;
@@ -390,8 +388,6 @@ public class IgniteImpl implements Ignite {
 
     /** Disaster recovery manager. */
     private final DisasterRecoveryManager disasterRecoveryManager;
-
-    private final PrimaryDistributionManager primaryDistributionManager;
 
     private final IndexManager indexManager;
 
@@ -1191,10 +1187,6 @@ public class IgniteImpl implements Ignite {
                 systemViewManager
         );
 
-        primaryDistributionManager = new PrimaryDistributionManager(metaStorageMgr, placementDriverMgr, catalogManager,
-                logicalTopologyService, clusterSvc, clockService, nodeProperties, replicationConfig,
-                disasterRecoveryManager, metricManager);
-
         indexManager = new IndexManager(
                 schemaManager,
                 distributedTblMgr,
@@ -1449,7 +1441,6 @@ public class IgniteImpl implements Ignite {
                 () -> new CodeDeploymentRestFactory(deploymentManager, deploymentManager.tempStorageProvider());
         Supplier<RestFactory> restManagerFactory = () -> new RestManagerFactory(restManager);
         Supplier<RestFactory> computeRestFactory = () -> new ComputeRestFactory(compute);
-        Supplier<RestFactory> distributionRestFactory = () -> new DistributionRestFactory(primaryDistributionManager);
         Supplier<RestFactory> disasterRecoveryFactory = () -> new DisasterRecoveryFactory(disasterRecoveryManager);
         Supplier<RestFactory> systemDisasterRecoveryFactory = () -> new SystemDisasterRecoveryFactory(systemDisasterRecoveryManager);
         Supplier<RestFactory> sqlQueryRestFactory = () -> new SqlQueryRestFactory(sql, killCommandHandler);
@@ -1466,7 +1457,6 @@ public class IgniteImpl implements Ignite {
                         authProviderFactory,
                         restManagerFactory,
                         computeRestFactory,
-                        distributionRestFactory,
                         disasterRecoveryFactory,
                         systemDisasterRecoveryFactory,
                         sqlQueryRestFactory,
@@ -1641,7 +1631,6 @@ public class IgniteImpl implements Ignite {
                                 partitionReplicaLifecycleManager,
                                 distributedTblMgr,
                                 disasterRecoveryManager,
-                                primaryDistributionManager,
                                 indexManager,
                                 indexBuildingManager,
                                 qryEngine,
@@ -1803,11 +1792,6 @@ public class IgniteImpl implements Ignite {
     @Override
     public IgniteTables tables() {
         return publicTables;
-    }
-
-    /** Returns Primary distribution management. */
-    public PrimaryDistributionManager primaryDistributionManager() {
-        return primaryDistributionManager;
     }
 
     public DisasterRecoveryManager disasterRecoveryManager() {

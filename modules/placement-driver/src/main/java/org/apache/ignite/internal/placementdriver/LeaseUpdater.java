@@ -287,41 +287,6 @@ public class LeaseUpdater {
         }
     }
 
-    /** Atomically denies a current lease together with fenced management progress. */
-    CompletableFuture<Boolean> transferForBalance(
-            Lease expected,
-            String target,
-            org.apache.ignite.internal.metastorage.dsl.Condition guard,
-            List<org.apache.ignite.internal.metastorage.dsl.Operation> progress
-    ) {
-        if (!active() || !stateChangingLock.enterBusy()) {
-            return completedFuture(false);
-        }
-        try {
-            if (!active()) {
-                return completedFuture(false);
-            }
-            Leases current = leaseTracker.leasesCurrent();
-            Lease lease = current.leaseByGroupId().get(expected.replicationGroupId());
-            if (lease == null || !lease.isAccepted() || !lease.isProlongable()
-                    || !lease.getStartTime().equals(expected.getStartTime())
-                    || !Objects.equals(lease.getLeaseholderId(), expected.getLeaseholderId())) {
-                return completedFuture(false);
-            }
-            List<Lease> renewed = new ArrayList<>(current.leaseByGroupId().values());
-            renewed.remove(lease);
-            renewed.add(lease.denyLease(target));
-            List<org.apache.ignite.internal.metastorage.dsl.Operation> updates = new ArrayList<>(progress);
-            updates.add(put(PLACEMENTDRIVER_LEASES_KEY, new LeaseBatch(renewed).bytes()));
-            return msManager.invoke(
-                    org.apache.ignite.internal.metastorage.dsl.Conditions.and(guard,
-                            value(PLACEMENTDRIVER_LEASES_KEY).eq(current.leasesBytes())),
-                    updates, List.of(noop()));
-        } finally {
-            stateChangingLock.leaveBusy();
-        }
-    }
-
     private static IgniteTuple3<List<Lease>, Boolean, Boolean> replaceProlongableLeaseInCollection(
             Collection<Lease> leases,
             Lease newLease
