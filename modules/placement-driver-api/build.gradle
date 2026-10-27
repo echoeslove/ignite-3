@@ -26,6 +26,7 @@ dependencies {
     implementation project(':ignite-core')
     implementation project(':ignite-network-api')
     implementation project(':ignite-partition-distribution')
+    implementation libs.jackson.annotations
     implementation libs.jetbrains.annotations
 
     testFixturesImplementation project(':ignite-core')

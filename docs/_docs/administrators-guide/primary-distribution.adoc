@@ -1,0 +1,93 @@
+= Primary Distribution and Manual Lease Balancing
+
+Primary distribution describes the accepted, currently valid lease holder for each replication group.
+With zone-based replication, tables in the same zone share groups; they are counted once per zone partition.
+The REST response includes lease status, holder startup UUID, stable peers, pending assignments, observation time and completeness.
+`leaseStart` is the full HLC generation token; preserve its logical component when comparing it.
+`leaseExpiration` and `observedAt` are physical milliseconds since the Unix epoch.
+
+== Observe
+
+[source,bash]
+----
+curl http://localhost:10300/management/v1/distribution/primary-replicas/summary
+curl 'http://localhost:10300/management/v1/distribution/primary-replicas/summary?zoneId=20'
+curl 'http://localhost:10300/management/v1/distribution/primary-replicas?zoneId=20&limit=100'
+----
+
+Continue a page with its snapshot ID and next offset, using the same filters.
+Snapshots expire after 60 seconds and can be continued on another node.
+Metadata observation does not read table data or wait for every Primary to appear.
+The summary counts accepted valid leases, including offline holders, separately from online Primary replicas.
+`withoutPrimary` counts groups with no accepted currently valid lease; an offline holder is reported in the node detail.
+`complete=false` or `freshness=STALE` prevents plan execution.
+
+== Preview
+
+[source,bash]
+----
+curl -H 'Content-Type: application/json' -d '{"zoneId":20,"maxMoves":16}' \
+  http://localhost:10300/management/v1/distribution/balance-leases/plan
+----
+
+Preview does not modify leases and is available while execution is disabled.
+Each plan covers one zone and expires after 60 seconds.
+Moves use online stable peers with a HEALTHY replica state and strictly reduce the sum of squared Primary counts.
+Groups in rebalance, groups without a valid Primary, unhealthy targets and groups in the 60-second cooldown are skipped.
+`maxMoves` is between 1 and 16; omitted or zero selects 16.
+The planner guarantees direct improvement under replica constraints, rather than a global optimum for every layout.
+
+== Execute and Check the Result
+
+Manual execution is disabled by default. Complete the Hotfix 6 upgrade of all online nodes before enabling it:
+
+[source,bash]
+----
+curl -X PATCH -H 'Content-Type: text/plain' \
+  --data 'ignite.replication.primaryBalanceEnabled=true' \
+  http://localhost:10300/management/v1/configuration/cluster
+curl -H 'Content-Type: application/json' \
+  -d '{"planId":"PLAN_ID","requestId":"CALLER_UNIQUE_ID"}' \
+  http://localhost:10300/management/v1/distribution/balance-leases
+curl http://localhost:10300/management/v1/distribution/balance-leases/operations/OPERATION_ID
+----
+
+Execution returns HTTP 202 and a durable operation ID. Reusing a request ID with the same plan returns the same operation.
+Only one operation and one lease migration can be in progress cluster-wide.
+Success requires observing a valid accepted lease on the target startup instance.
+Assignments and the existing lease serialization format are preserved.
+
+The active Placement Driver writes lease denial and operation progress in the same MetaStorage CAS,
+conditioned on the active operation, PD term fence, stable assignment revision and absence of pending assignments.
+A PD change interrupts remaining moves; the replacement actor reconciles submitted moves without resuming the remaining plan.
+
+`ignite.replication.primaryBalanceTimeoutMillis` defaults to 30000 (allowed range 100..120000).
+A timeout reports `PARTIAL`, `MIGRATION_TIMEOUT` and `unresolved=true`.
+The operation continues observing the submitted move and blocks another operation until the actual result is known.
+A late successful migration does not turn the timed-out operation into an unconditional `SUCCEEDED` result.
+If the group cannot recover, the unresolved state remains visible and requires investigation of that group.
+Disabling execution stops unsubmitted work; a lease denial already committed can still take effect.
+
+== Transaction Behavior
+
+A Primary migration waits for the old lease to expire and may cause a transaction that enlisted that lease to roll back.
+Explicit transactions can report `TX_PRIMARY_REPLICA_EXPIRED` at commit or a Primary-replica-miss error during an operation.
+The application must retry the entire transaction after a confirmed rollback, within a bounded retry budget.
+Do not retry an unknown commit outcome without application idempotency or transaction-outcome resolution.
+A balancing operation completing successfully is not a guarantee that every individual application attempt succeeded.
+
+The validation workload counts confirmed rollback retries separately, checks multi-row snapshot consistency,
+and compares final values with acknowledged commits.
+
+== Metrics and Retention
+
+The `primary-distribution` metric source provides `LocalPrimaryCount`, `SnapshotStale`, `ActiveReporter`,
+`WithoutPrimary`, `MigrationsSucceeded`, `MigrationsFailed`, `MigrationsTimedOut` and `MigrationDurationMillis`.
+Metric reads use a cached summary refreshed every five seconds.
+`WithoutPrimary` is a cluster count on the active reporter only (otherwise -1); filter `ActiveReporter=1` before aggregating it.
+Migration counters are process-local and can be aggregated as increments with restart handling.
+No partition identifier is a permanent metric dimension.
+
+Snapshot and plan records are garbage collected after two minutes; operation and request records after 24 hours.
+The current active operation and its request record remain protected, including unresolved operations.
+Management record keys are versioned independently from the existing placement-driver lease keys.

@@ -111,6 +111,10 @@ public class PlacementDriverManager implements IgniteComponent {
 
     private final MetricManager metricManager;
 
+    private volatile long actorTerm;
+
+    private volatile long observedTerm;
+
     /**
      * Constructor.
      *
@@ -276,6 +280,19 @@ public class PlacementDriverManager implements IgniteComponent {
 
     private void onLeaderChange(InternalClusterNode leader, long term) {
         inBusyLock(busyLock, () -> {
+            if (term < observedTerm) {
+                return;
+            }
+            observedTerm = term;
+            actorTerm = leader.equals(clusterService.topologyService().localMember()) ? term : 0;
+            byte[] fence = PrimaryDistributionManager.termBytes(term);
+            ByteArray fenceKey = PrimaryDistributionManager.FENCE_KEY;
+            metastore.invoke(
+                    org.apache.ignite.internal.metastorage.dsl.Conditions.or(
+                            org.apache.ignite.internal.metastorage.dsl.Conditions.notExists(fenceKey),
+                            org.apache.ignite.internal.metastorage.dsl.Conditions.value(fenceKey).lt(fence)),
+                    org.apache.ignite.internal.metastorage.dsl.Operations.put(fenceKey, fence),
+                    org.apache.ignite.internal.metastorage.dsl.Operations.noop());
             if (leader.equals(clusterService.topologyService().localMember())) {
                 takeOverActiveActorBusy();
             } else {
@@ -297,6 +314,21 @@ public class PlacementDriverManager implements IgniteComponent {
     @TestOnly
     boolean isActiveActor() {
         return leaseUpdater.active();
+    }
+
+    /** Returns this actor's active term, or zero on a follower. */
+    public long activeActorTerm() {
+        return leaseUpdater.active() ? actorTerm : 0;
+    }
+
+    /** Submits a fenced lease transfer and management progress in the same MetaStorage transaction. */
+    CompletableFuture<Boolean> transferForBalance(
+            org.apache.ignite.internal.placementdriver.leases.Lease expected,
+            String target,
+            org.apache.ignite.internal.metastorage.dsl.Condition guard,
+            List<org.apache.ignite.internal.metastorage.dsl.Operation> progress
+    ) {
+        return leaseUpdater.transferForBalance(expected, target, guard, progress);
     }
 
     /** Returns placement driver service. */

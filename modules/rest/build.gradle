@@ -27,6 +27,8 @@ dependencies {
     annotationProcessor libs.micronaut.inject.annotation.processor
     annotationProcessor libs.auto.service
 
+    implementation project(':ignite-placement-driver')
+    implementation project(':ignite-placement-driver-api')
     implementation project(':ignite-api')
     implementation project(':ignite-configuration')
     implementation project(':ignite-configuration-root')
@@ -73,6 +75,13 @@ dependencies {
     integrationTestAnnotationProcessor libs.micronaut.inject.annotation.processor
     integrationTestAnnotationProcessor testFixtures(project(':ignite-core'))
 
+    integrationTestImplementation project(':ignite-placement-driver')
+    integrationTestImplementation project(':ignite-placement-driver-api')
+    integrationTestImplementation project(':ignite-metastorage-api')
+    integrationTestImplementation project(':ignite-metastorage')
+    integrationTestImplementation project(':ignite-replicator')
+    integrationTestImplementation project(':ignite-raft')
+    integrationTestImplementation project(':ignite-raft-api')
     integrationTestImplementation project(':ignite-api')
     integrationTestImplementation project(':ignite-core')
     integrationTestImplementation project(':ignite-catalog')

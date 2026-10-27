@@ -70,4 +70,12 @@ public class ReplicationConfigurationSchema {
     @Range(min = 1)
     @Value(hasDefault = true)
     public int batchSizeBytes = DEFAULT_BATCH_SIZE_BYTES;
+    /** Enables explicitly requested manual Primary lease balancing. */
+    @Value(hasDefault = true)
+    public boolean primaryBalanceEnabled = false;
+
+    /** Maximum time to observe a submitted manual lease transfer before reporting an unknown result. */
+    @Value(hasDefault = true)
+    @Range(min = 100, max = 120000)
+    public long primaryBalanceTimeoutMillis = 30_000;
 }
